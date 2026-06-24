@@ -106,7 +106,7 @@ pip install -r requirements.txt
 ```bash
 python main.py
 ```
-##Building the Executable
+## Building the Executable
 Two batch files are provided in the root:
 
 build_clean.bat – builds an EXE without embedding JSON files (defaults created on first run).
@@ -115,7 +115,7 @@ build_with_json.bat – builds an EXE that includes all *.json files.
 
 Run the desired batch file from the project root.
 
-##Usage
+## Usage
 Launch as Administrator – right‑click the EXE and select "Run as administrator".
 
 Add Apps (optional) – go to the Apps tab and select your preferred providers (Offline/Winget/Choco).
@@ -132,7 +132,7 @@ Deploy – click the Deploy button. The status panel will show progress, and the
 
 Cancel – click Cancel to stop the deployment after the current operation finishes.
 
-##Configuration Files
+## Configuration Files
 All settings are stored in JSON files in the same directory as the executable (or source folder):
 
 settings.json – general settings, command templates, and available operations.
@@ -150,10 +150,10 @@ You can edit these files manually or via the Settings dialog (Settings → [tab]
 Contributing
 Contributions are welcome! Please open an issue or pull request for any improvements, bug fixes, or new features.
 
-##License
+## License
 
 
-##Acknowledgements
+## Acknowledgements
 PyInstaller – for packaging.
 
 py7zr – for 7z archive support.
