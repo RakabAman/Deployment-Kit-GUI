@@ -1,0 +1,62 @@
+{
+    "apps": [
+        {
+            "display_name": "Google Chrome",
+            "category": "Browser",
+            "offline_path": "install\\chrome_installer.exe",
+            "offline_switch": "/silent /install",
+            "offline_version": "",
+            "offline_download_url": "",
+            "winget_id": "Google.Chrome",
+            "choco_id": "googlechrome",
+            "install_type": "silent",
+            "tags": [
+                "browser",
+                "essential"
+            ],
+            "post_install_script": ""
+        },
+        {
+            "display_name": "7-Zip",
+            "category": "Utilities",
+            "offline_path": "install\\7zip.msi",
+            "offline_switch": "/quiet /norestart",
+            "offline_version": "",
+            "offline_download_url": "",
+            "winget_id": "7zip.7zip",
+            "choco_id": "7zip",
+            "install_type": "silent",
+            "tags": [
+                "archive",
+                "essential"
+            ],
+            "post_install_script": "install\\7-Zip\\post_install.ps1"
+        },
+        {
+            "display_name": "dad",
+            "category": "adf",
+            "offline_path": "",
+            "offline_switch": "adf",
+            "offline_version": "",
+            "offline_download_url": "aads",
+            "winget_id": "adsf",
+            "choco_id": "",
+            "install_type": "silent",
+            "tags": [],
+            "post_install_script": ""
+        },
+        {
+            "display_name": "test_add",
+            "category": "",
+            "offline_path": "",
+            "offline_switch": "",
+            "offline_version": "",
+            "offline_download_url": "",
+            "winget_id": "",
+            "choco_id": "",
+            "install_type": "non_silent",
+            "tags": [],
+            "post_install_script": ""
+        }
+    ]
+}

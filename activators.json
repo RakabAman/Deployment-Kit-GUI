@@ -1,0 +1,136 @@
+{
+    "activators": [
+        {
+            "name": "MAS HWID Activation (Windows)",
+            "category": "Windows",
+            "description": "Permanent HWID activation for Windows 10/11 (MAS)",
+            "executable": "MAS_AIO.cmd",
+            "folder": "",
+            "archive": "",
+            "default_switches": "/HWID-NoEditionChange",
+            "download_url": "https://github.com/massgravel/Microsoft-Activation-Scripts/archive/refs/heads/master.zip",
+            "github_repo": "massgravel/Microsoft-Activation-Scripts",
+            "github_asset_pattern": "*.zip"
+        },
+        {
+            "name": "MAS KMS38 Activation (Windows)",
+            "category": "Windows",
+            "description": "KMS38 activation for Windows 10/11 (valid until 2038)",
+            "executable": "MAS_AIO.cmd",
+            "folder": "",
+            "archive": "",
+            "default_switches": "/KMS38-NoEditionChange",
+            "download_url": "https://github.com/massgravel/Microsoft-Activation-Scripts/archive/refs/heads/master.zip",
+            "github_repo": "massgravel/Microsoft-Activation-Scripts",
+            "github_asset_pattern": "*.zip"
+        },
+        {
+            "name": "MAS Ohook Activation (Office)",
+            "category": "Office",
+            "description": "Permanent Ohook activation for Office (MAS)",
+            "executable": "MAS_AIO.cmd",
+            "folder": "",
+            "archive": "",
+            "default_switches": "/Ohook",
+            "download_url": "https://github.com/massgravel/Microsoft-Activation-Scripts/archive/refs/heads/master.zip",
+            "github_repo": "massgravel/Microsoft-Activation-Scripts",
+            "github_asset_pattern": "*.zip"
+        },
+        {
+            "name": "MAS Online KMS (Windows/Office)",
+            "category": "Windows",
+            "description": "Online KMS activation for Windows/Office (180 days)",
+            "executable": "MAS_AIO.cmd",
+            "folder": "",
+            "archive": "",
+            "default_switches": "/OnlineKMS",
+            "download_url": "https://github.com/massgravel/Microsoft-Activation-Scripts/archive/refs/heads/master.zip",
+            "github_repo": "massgravel/Microsoft-Activation-Scripts",
+            "github_asset_pattern": "*.zip"
+        },
+        {
+            "name": "MAS Renewal (KMS)",
+            "category": "Windows",
+            "description": "Renew KMS activation for Windows/Office",
+            "executable": "MAS_AIO.cmd",
+            "folder": "",
+            "archive": "",
+            "default_switches": "/Renewal",
+            "download_url": "https://github.com/massgravel/Microsoft-Activation-Scripts/archive/refs/heads/master.zip",
+            "github_repo": "massgravel/Microsoft-Activation-Scripts",
+            "github_asset_pattern": "*.zip"
+        },
+        {
+            "name": "KMS_VL_ALL (Windows/Office)",
+            "category": "Windows",
+            "description": "All-in-one KMS activator for Windows and Office (open-source)",
+            "executable": "KMS_VL_ALL.cmd",
+            "folder": "",
+            "archive": "",
+            "default_switches": "/s",
+            "download_url": "https://github.com/abbodi1406/KMS_VL_ALL/archive/refs/heads/master.zip",
+            "github_repo": "abbodi1406/KMS_VL_ALL",
+            "github_asset_pattern": "*.zip"
+        },
+        {
+            "name": "KMS_VL_ALL Office Only",
+            "category": "Office",
+            "description": "KMS_VL_ALL - Office only activation",
+            "executable": "KMS_VL_ALL.cmd",
+            "folder": "",
+            "archive": "",
+            "default_switches": "/s /o",
+            "download_url": "https://github.com/abbodi1406/KMS_VL_ALL/archive/refs/heads/master.zip",
+            "github_repo": "abbodi1406/KMS_VL_ALL",
+            "github_asset_pattern": "*.zip"
+        },
+        {
+            "name": "KMS_VL_ALL Windows Only",
+            "category": "Windows",
+            "description": "KMS_VL_ALL - Windows only activation",
+            "executable": "KMS_VL_ALL.cmd",
+            "folder": "",
+            "archive": "",
+            "default_switches": "/s /w",
+            "download_url": "https://github.com/abbodi1406/KMS_VL_ALL/archive/refs/heads/master.zip",
+            "github_repo": "abbodi1406/KMS_VL_ALL",
+            "github_asset_pattern": "*.zip"
+        },
+        {
+            "name": "KMSpico (Windows/Office)",
+            "category": "Windows",
+            "description": "Popular KMS activator for Windows and Office (GUI)",
+            "executable": "KMSpico.exe",
+            "folder": "",
+            "archive": "",
+            "default_switches": "/silent",
+            "download_url": "",
+            "github_repo": "",
+            "github_asset_pattern": ""
+        },
+        {
+            "name": "Windows Loader (Windows 7)",
+            "category": "Windows",
+            "description": "Classic Windows 7 activation loader (by Daz)",
+            "executable": "WindowsLoader.exe",
+            "folder": "",
+            "archive": "",
+            "default_switches": "/silent",
+            "download_url": "",
+            "github_repo": "",
+            "github_asset_pattern": ""
+        },
+        {
+            "name": "test_activator",
+            "category": "",
+            "description": "",
+            "executable": "C:/D Drive/PRIVATE/BACKUP/Rakab_Docs/PROJECTS/My Scripts/Deployment_kit_gui/Developing/modules/test/test_powershell.ps1",
+            "folder": "",
+            "archive": "",
+            "default_switches": "",
+            "download_url": "",
+            "github_repo": "",
+            "github_asset_pattern": ""
+        }
+    ]
+}

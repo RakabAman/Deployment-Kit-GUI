@@ -1,0 +1,26 @@
+{
+    "tweaks": [
+        {
+            "name": "Install Custom Scripts (EcMenu)",
+            "category": "Shell Extensions",
+            "description": "Copies Custom Scripts folder, imports registry entries, registers EcMenu shell extension.",
+            "script_type": "bat",
+            "arguments": "",
+            "enable_script": "echo \"enable tweak\"\npause",
+            "disable_script": "echo \"disbale function\"\ntimeout 10",
+            "enabled": false,
+            "selected_action": "enable"
+        },
+        {
+            "name": "Install Power Tools",
+            "category": "System",
+            "description": "Extracts PowerTools archive to %SystemDrive%\\PowerTools.",
+            "script_type": "ps1",
+            "enable_script": "backup\\powertools\\PowerTools_install.ps1",
+            "disable_script": "",
+            "arguments": "",
+            "enabled": false,
+            "selected_action": null
+        }
+    ]
+}

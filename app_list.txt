@@ -1,0 +1,34 @@
+APODriver (APO Audio)
+Autohotkey
+Brave Browser
+CPUZ
+dotNET
+GhostScript (PDF scripter)
+google chrome
+HW Info
+ImageMagick (Image Converter CLi)
+J-Downloader
+K-lite Mega
+MSIAfterburner (GPU Overclocker)
+Notepad++
+Parsec
+PowerToys
+Prio (Priotize CPU handles)
+Razer Cortex
+ReaConverter
+reWASD
+teamviewer
+VisualCppRedist
+anydesk
+WinRAR
+free downloader
+Internet download manager
+Chocolatey
+winget
+
+
+drivers
+amd chipset
+AAFOptimusDCHAudioPack
+AMD-Ryzen-Master
+Virtual Audio Cable by Eugene V. Muzychenko
