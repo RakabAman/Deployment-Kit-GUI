@@ -53,150 +53,101 @@ class AppEntry:
             return ""
         if self._winget_version and (time.time() - self._version_cache_time) < 300:
             return self._winget_version
-        if not shutil.which('winget'):
-            self._winget_version = "Winget not found"
-            self._version_cache_time = time.time()
-            return self._winget_version
 
-        def extract_version_from_show(stdout):
-            for line in stdout.split('\n'):
-                if 'Version' in line and ':' in line:
-                    version = line.split(':', 1)[1].strip()
-                    version = ''.join(c for c in version if c.isprintable())
-                    if version:
-                        return version
-            return None
-
-        # First attempt: winget show
         try:
             cmd = self.config.get_command('winget_version', id=self.winget_id)
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='ignore',
-                timeout=60
-            )
-            if result.returncode == 0:
-                version = extract_version_from_show(result.stdout)
-                if version:
-                    self._winget_version = version
-                    self._version_cache_time = time.time()
-                    return version
-        except (subprocess.TimeoutExpired, Exception):
-            pass
+            result = subprocess.run(cmd, shell=True, capture_output=True, timeout=10)
+            stdout = result.stdout.decode('utf-8', errors='ignore')
+            stderr = result.stderr.decode('utf-8', errors='ignore')
 
-        # Fallback: winget search
-        try:
-            cmd_search = f"winget search {self.winget_id} --exact"
-            result = subprocess.run(
-                cmd_search,
-                shell=True,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='ignore',
-                timeout=30
-            )
+            # Debug: print the full command and output (optional)
+            # print(f"CMD: {cmd}")
+            # print(f"STDOUT: {stdout[:200]}")
+            # print(f"STDERR: {stderr[:200]}")
+
             if result.returncode == 0:
-                lines = result.stdout.split('\n')
-                for line in lines:
-                    if self.winget_id.lower() in line.lower():
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            version = parts[2].strip()
-                            if version:
+                for line in stdout.split('\n'):
+                    if 'Version' in line and ':' in line:
+                        version = line.split(':', 1)[1].strip()
+                        self._winget_version = version
+                        self._version_cache_time = time.time()
+                        return version
+                # Fallback: winget list
+                cmd2 = f"winget list {self.winget_id} --exact"
+                result2 = subprocess.run(cmd2, shell=True, capture_output=True, timeout=10)
+                stdout2 = result2.stdout.decode('utf-8', errors='ignore')
+                if result2.returncode == 0:
+                    for line in stdout2.split('\n'):
+                        if self.winget_id.lower() in line.lower():
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                version = parts[2].strip()
                                 self._winget_version = version
                                 self._version_cache_time = time.time()
                                 return version
-        except Exception:
-            pass
+                self._winget_version = "No version found"
+            else:
+                # Combine stdout and stderr for error message
+                error = stderr.strip() or stdout.strip()
+                if "not found" in error.lower() or "no such" in error.lower():
+                    self._winget_version = "Not found"
+                else:
+                    # Show the first 40 characters of the error
+                    error_short = error.replace('\n', ' ')[:40]
+                    self._winget_version = f"Error: {error_short}" if error_short else f"Error ({result.returncode})"
+            self._version_cache_time = time.time()
+            return self._winget_version
 
-        self._winget_version = "Not found"
-        self._version_cache_time = time.time()
-        return self._winget_version
-
+        except FileNotFoundError:
+            self._winget_version = "Winget not installed"
+            self._version_cache_time = time.time()
+            return self._winget_version
+        except Exception as e:
+            self._winget_version = f"Error: {str(e)[:20]}"
+            self._version_cache_time = time.time()
+            return self._winget_version
+            
     def get_choco_version(self):
         if not self.choco_id:
             return ""
         if self._choco_version and (time.time() - self._version_cache_time) < 300:
             return self._choco_version
-        if not shutil.which('choco'):
-            self._choco_version = "Choco not installed"
+
+        try:
+            cmd = self.config.get_command('choco_version', package=self.choco_id)
+            result = subprocess.run(cmd, shell=True, capture_output=True, timeout=10)
+            stdout = result.stdout.decode('utf-8', errors='ignore')
+            stderr = result.stderr.decode('utf-8', errors='ignore')
+
+            if result.returncode == 0:
+                for line in stdout.split('\n'):
+                    if self.choco_id in line:
+                        parts = line.split('|')
+                        if len(parts) >= 2:
+                            version = parts[1].strip()
+                            self._choco_version = version
+                            self._version_cache_time = time.time()
+                            return version
+                self._choco_version = "No version found"
+            else:
+                error = stderr.strip() or stdout.strip()
+                if "not found" in error.lower() or "no such" in error.lower():
+                    self._choco_version = "Not found"
+                else:
+                    error_short = error.replace('\n', ' ')[:40]
+                    self._choco_version = f"Error: {error_short}" if error_short else f"Error ({result.returncode})"
             self._version_cache_time = time.time()
             return self._choco_version
 
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                cmd = self.config.get_command('choco_version', package=self.choco_id)
-                result = subprocess.run(
-                    cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='ignore',
-                    timeout=60
-                )
-                if result.returncode == 0:
-                    for line in result.stdout.split('\n'):
-                        if self.choco_id in line:
-                            parts = line.split('|')
-                            if len(parts) >= 2:
-                                version = parts[1].strip()
-                                self._choco_version = version
-                                self._version_cache_time = time.time()
-                                return version
-                    self._choco_version = "No version found"
-                    self._version_cache_time = time.time()
-                    return self._choco_version
-                else:
-                    error_msg = result.stderr.strip() or result.stdout.strip()
-                    # Check if the error suggests a network/retry issue
-                    if error_msg and ("try" in error_msg.lower() or "retry" in error_msg.lower()):
-                        # Network error – retry if not last attempt
-                        if attempt < max_retries - 1:
-                            time.sleep(0.5)  # wait 500ms before retry
-                            continue
-                        else:
-                            # Last attempt failed; treat as not found
-                            self._choco_version = "Not found"
-                            self._version_cache_time = time.time()
-                            return self._choco_version
-                    else:
-                        # Other error
-                        if "not found" in error_msg.lower() or "no such" in error_msg.lower():
-                            self._choco_version = "Not found"
-                        else:
-                            self._choco_version = f"Error: {error_msg[:30]}" if error_msg else f"Error ({result.returncode})"
-                        self._version_cache_time = time.time()
-                        return self._choco_version
-            except subprocess.TimeoutExpired:
-                # Timeout: treat as network issue, retry if not last attempt
-                if attempt < max_retries - 1:
-                    time.sleep(0.5)
-                    continue
-                else:
-                    self._choco_version = "Timeout"
-                    self._version_cache_time = time.time()
-                    return self._choco_version
-            except FileNotFoundError:
-                self._choco_version = "Choco not installed"
-                self._version_cache_time = time.time()
-                return self._choco_version
-            except Exception as e:
-                self._choco_version = f"Error: {str(e)[:30]}"
-                self._version_cache_time = time.time()
-                return self._choco_version
-
-        # Fallback (should not reach here)
-        self._choco_version = "Not found"
-        self._version_cache_time = time.time()
-        return self._choco_version
-
+        except FileNotFoundError:
+            self._choco_version = "Choco not installed (PATH)"
+            self._version_cache_time = time.time()
+            return self._choco_version
+        except Exception as e:
+            self._choco_version = f"Error: {str(e)[:20]}"
+            self._version_cache_time = time.time()
+            return self._choco_version
+            
     def get_display_version(self, provider):
         if provider == 'offline':
             return self.offline_version or "N/A"
@@ -394,4 +345,41 @@ class AppCatalog:
             return True, "Download successful"
         except Exception as e:
             return False, f"Download failed: {str(e)}"
-            
+
+    def fetch_all_versions_async(self, callback):
+        import threading
+
+        def fetch_one(app, provider):
+            try:
+                if provider == 'winget':
+                    if not app.winget_id:
+                        return
+                    if app._winget_version and (time.time() - app._version_cache_time) < 300:
+                        version = app._winget_version
+                    else:
+                        version = app.get_winget_version()
+                    callback(app.display_name, 'winget', version)
+                elif provider == 'choco':
+                    if not app.choco_id:
+                        return
+                    if app._choco_version and (time.time() - app._version_cache_time) < 300:
+                        version = app._choco_version
+                    else:
+                        version = app.get_choco_version()
+                    callback(app.display_name, 'choco', version)
+            except Exception as e:
+                callback(app.display_name, provider, f"Error: {str(e)[:15]}")
+
+        tasks = []
+        for app in self.apps:
+            if app.winget_id:
+                tasks.append((app, 'winget'))
+            if app.choco_id:
+                tasks.append((app, 'choco'))
+
+        if not tasks:
+            return
+
+        for app, provider in tasks:
+            thread = threading.Thread(target=fetch_one, args=(app, provider), daemon=True)
+            thread.start() 

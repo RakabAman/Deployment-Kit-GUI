@@ -113,7 +113,7 @@ class ConfigManager:
                     "offline_msi": "msiexec /i \"{path}\" {switch}",
                     "offline_exe": "\"{path}\" {switch}",
                     "winget_version": "winget show {id}",
-                    "choco_version": "choco list {package} --limit-output",
+                    "choco_version": "choco find {package} --exact --limit-output",
                     "tweak_ps1": "powershell -ExecutionPolicy Bypass -File \"{path}\"",
                     "tweak_bat": "\"{path}\"",
                     "tweak_py": "python \"{path}\"",
@@ -354,7 +354,7 @@ class ConfigManager:
     def get_command(self, template_name, **kwargs):
         templates = self.settings.get('command_templates', {})
         template = templates.get(template_name, '')
-        if not template:
+        if not template:        
             fallbacks = {
                 'winget_install': 'winget install {id} --silent',
                 'winget_upgrade': 'winget upgrade {id} --silent',
@@ -365,7 +365,7 @@ class ConfigManager:
                 'offline_msi': 'msiexec /i "{path}" {switch}',
                 'offline_exe': '"{path}" {switch}',
                 'winget_version': 'winget show {id}',
-                'choco_version': 'choco list {package} --limit-output',
+                'choco_version': 'choco find {package} --exact --limit-output',
                 'tweak_ps1': 'powershell -ExecutionPolicy Bypass -File "{path}"',
                 'tweak_bat': '"{path}"',
                 'tweak_py': 'python "{path}"',

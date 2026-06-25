@@ -29,10 +29,7 @@ class DeploymentGUI:
         self.available_ops = self.config.get_operations()
         
         self.external_scripts = []  # list of script dicts
-        self.app_tree_items = {}    # <-- ADD THIS
 
-        self.backup_tree_items = {}  # source_path -> dict with item, special, subfolder
-        
         self._build_ui()
         self._poll_logs()
 
@@ -289,16 +286,17 @@ class DeploymentGUI:
         filter_combo.pack(side=tk.LEFT, padx=5)
         filter_combo.bind('<<ComboboxSelected>>', lambda e: self._refresh_install_tab())
 
-        ttk.Button(filter_frame, text="Check Version", command=self._refresh_versions).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(filter_frame, text="Refresh Versions", command=self._refresh_versions).pack(side=tk.RIGHT, padx=5)
 
         self.install_container = ttk.Frame(self.install_frame)
         self.install_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
+        self.app_radio_vars = {}
+        self.version_labels = {}
+
         self._refresh_install_tab()
 
     def _refresh_install_tab(self):
-        """Rebuild the Apps tab using a Treeview with checkboxes."""
-        # Clear container
         for widget in self.install_container.winfo_children():
             widget.destroy()
 
@@ -306,228 +304,187 @@ class DeploymentGUI:
         search_text = self.search_var.get().strip().lower()
         filter_type = self.filter_var.get().lower()
 
-        # Create Treeview
-        columns = ('name', 'category', 'type', 'offline', 'winget', 'choco')
-        self.tree_apps = ttk.Treeview(self.install_container, columns=columns, show='headings', height=15)
-        self.tree_apps.heading('name', text='App Name')
-        self.tree_apps.heading('category', text='Category')
-        self.tree_apps.heading('type', text='Type')
-        self.tree_apps.heading('offline', text='Offline')
-        self.tree_apps.heading('winget', text='Winget')
-        self.tree_apps.heading('choco', text='Choco')
+        main_frame = tk.Frame(self.install_container, bg='white')
+        main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Set column widths
-        self.tree_apps.column('name', width=250, anchor='w', stretch=False)
-        self.tree_apps.column('category', width=120, anchor='w', stretch=False)
-        self.tree_apps.column('type', width=80, anchor='w', stretch=False)
-        self.tree_apps.column('offline', width=120, anchor='center', stretch=False)
-        self.tree_apps.column('winget', width=150, anchor='center', stretch=False)
-        self.tree_apps.column('choco', width=150, anchor='center', stretch=False)
+        header_frame = tk.Frame(main_frame, bg='white')
+        header_frame.pack(fill=tk.X, pady=(0, 4))
 
-        # Scrollbar
-        scrollbar = ttk.Scrollbar(self.install_container, orient="vertical", command=self.tree_apps.yview)
-        self.tree_apps.configure(yscrollcommand=scrollbar.set)
-        self.tree_apps.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        col_widths = {
+            'name': 250, 'category': 130, 'type': 80, 'none': 60,
+            'offline': 130, 'winget': 180, 'choco': 280
+        }
+        col_keys = ['name', 'category', 'type', 'none', 'offline', 'winget', 'choco']
+        col_key_display = {
+            'name': 'App Name', 'category': 'Category', 'type': 'Type',
+            'none': 'None', 'offline': 'Offline', 'winget': 'Winget', 'choco': 'Choco'
+        }
+
+        for i, key in enumerate(col_keys):
+            header_frame.columnconfigure(i, weight=0, minsize=col_widths[key])
+        header_frame.columnconfigure(7, weight=1)
+
+        for i, key in enumerate(col_keys):
+            ttk.Label(header_frame, text=col_key_display[key],
+                      font=('Arial', 10, 'bold'), anchor='w', background='white') \
+                .grid(row=0, column=i, padx=4, sticky='w')
+
+        ttk.Separator(main_frame, orient='horizontal').pack(fill=tk.X, pady=4)
+
+        canvas_container = tk.Frame(main_frame, bg='white')
+        canvas_container.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(canvas_container, highlightthickness=0, bg='white')
+        scrollbar = ttk.Scrollbar(canvas_container, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg='white')
+
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Bind click event
-        self.tree_apps.bind('<Button-1>', self._on_app_click)
+        self.version_labels = {}
+        self.app_radio_vars = {}
 
-        # Clear caches
-        self.app_tree_items = {}  # display_name -> tree item id
-
-        # Populate rows
+        row = 0
         for app in self.catalog.apps:
             if search_text and search_text not in app.display_name.lower():
                 continue
             if filter_type != 'all' and app.install_type != filter_type:
                 continue
 
-            # Build initial cell texts
-            offline_text = self._build_cell_text(app, 'offline')
-            winget_text = self._build_cell_text(app, 'winget')
-            choco_text = self._build_cell_text(app, 'choco')
+            default = -1
+            if app.selected_provider == 'offline':
+                default = 0
+            elif app.selected_provider == 'winget':
+                default = 1
+            elif app.selected_provider == 'choco':
+                default = 2
+            if default == -1 and app.is_offline_available and app.offline_path:
+                default = 0
+                app.selected_provider = 'offline'
 
-            item = self.tree_apps.insert('', tk.END, values=(
-                app.display_name,
-                app.category or "Uncategorized",
-                app.install_type.capitalize(),
-                offline_text,
-                winget_text,
-                choco_text
-            ))
-            self.app_tree_items[app.display_name] = item
+            row_frame = tk.Frame(scrollable_frame, bg='white')
+            row_frame.grid(row=row, column=0, columnspan=8, sticky='w', pady=1)
 
-        # Show cached versions if any
-        self._display_cached_versions() 
+            ttk.Label(row_frame, text=app.display_name, anchor='w',
+                      font=('Arial', 9), width=col_widths['name']//7, background='white') \
+                .grid(row=0, column=0, padx=4, sticky='w')
+
+            ttk.Label(row_frame, text=app.category or "Uncategorized", anchor='w',
+                      font=('Arial', 9), width=col_widths['category']//8, background='white') \
+                .grid(row=0, column=1, padx=(5,4), sticky='w')
+
+            type_display = app.install_type.capitalize()
+            if app.install_type == 'non_silent':
+                type_display = 'Non-Silent'
+            ttk.Label(row_frame, text=type_display, anchor='w',
+                      font=('Arial', 9), width=col_widths['type']//8, background='white') \
+                .grid(row=0, column=2, padx=4, sticky='w')
+
+            provider_var = tk.IntVar(value=default)
+            self.app_radio_vars[app.display_name] = provider_var
+
+            none_frame = tk.Frame(row_frame, bg='white')
+            none_frame.grid(row=0, column=3, padx=(10,4), sticky='w')
+            rb_none = ttk.Radiobutton(none_frame, variable=provider_var, value=-1,
+                                      command=lambda a=app, v=provider_var: self._set_provider(a, v))
+            rb_none.pack(side=tk.LEFT)
+
+            offline_frame = tk.Frame(row_frame, bg='white')
+            offline_frame.grid(row=0, column=4, padx=4, sticky='w')
+            rb_offline = ttk.Radiobutton(offline_frame, variable=provider_var, value=0,
+                                         command=lambda a=app, v=provider_var: self._set_provider(a, v))
+            rb_offline.pack(side=tk.LEFT, padx=(30, 2))
+            if not app.is_offline_available or not app.offline_path:
+                rb_offline.config(state=tk.DISABLED)
+            offline_ver_label = ttk.Label(offline_frame, text=app.offline_version or "N/A",
+                                          anchor='w', font=('Arial', 9), width=12, background='white')
+            offline_ver_label.pack(side=tk.LEFT, padx=2)
+
+            winget_frame = tk.Frame(row_frame, bg='white')
+            winget_frame.grid(row=0, column=5, padx=4, sticky='w')
+            rb_winget = ttk.Radiobutton(winget_frame, variable=provider_var, value=1,
+                                        command=lambda a=app, v=provider_var: self._set_provider(a, v))
+            rb_winget.pack(side=tk.LEFT, padx=(5, 2))
+            if not app.winget_id:
+                rb_winget.config(state=tk.DISABLED)
+            winget_ver_label = ttk.Label(winget_frame, text="?", anchor='w',
+                                         font=('Arial', 9), width=30, background='white')
+            winget_ver_label.pack(side=tk.LEFT, padx=2)
+
+            choco_frame = tk.Frame(row_frame, bg='white')
+            choco_frame.grid(row=0, column=6, padx=4, sticky='w')
+            rb_choco = ttk.Radiobutton(choco_frame, variable=provider_var, value=2,
+                                       command=lambda a=app, v=provider_var: self._set_provider(a, v))
+            rb_choco.pack(side=tk.LEFT, padx=(2, 2))
+            if not app.choco_id:
+                rb_choco.config(state=tk.DISABLED)
+            choco_ver_label = ttk.Label(choco_frame, text="?", anchor='w',
+                                        font=('Arial', 9), width=50, background='white')
+            choco_ver_label.pack(side=tk.LEFT, padx=2)
+
+            self.version_labels[app.display_name] = {
+                'offline': offline_ver_label,
+                'winget': winget_ver_label,
+                'choco': choco_ver_label
+            }
+
+            row += 1
+
+        # Instead of fetching fresh versions, first display cached ones, then fetch fresh in background
+        self._display_cached_versions()
+        self._fetch_versions_background()
+        
+
+    def _set_provider(self, app, var):
+        value = var.get()
+        if value == 0:
+            app.selected_provider = 'offline'
+        elif value == 1:
+            app.selected_provider = 'winget'
+        elif value == 2:
+            app.selected_provider = 'choco'
+        else:
+            app.selected_provider = None
 
     def _fetch_versions_background(self):
-        """Fetch versions in parallel, updating labels as they arrive."""
-        import threading
-        import time
-
+        """Fetch versions in parallel and update labels as they arrive."""
         def version_callback(display_name, provider, version):
-            try:
-                self.root.after_idle(
-                    lambda: self._update_single_version(display_name, provider, version)
-                )
-            except RuntimeError:
-                pass
+            # Schedule UI update on main thread
+            self.root.after(0, lambda: self._update_single_version(display_name, provider, version))
 
-        def fetch_one(app, provider):
-            try:
-                if provider == 'winget':
-                    if not app.winget_id:
-                        return
-                    if app._winget_version and (time.time() - app._version_cache_time) < 300:
-                        version = app._winget_version
-                    else:
-                        version = app.get_winget_version()
-                   print(f"DEBUG winget: {app.display_name} -> {version}")
-                    version_callback(app.display_name, 'winget', version)
-                elif provider == 'choco':
-                    if not app.choco_id:
-                        return
-                    if app._choco_version and (time.time() - app._version_cache_time) < 300:
-                        version = app._choco_version
-                    else:
-                        version = app.get_choco_version()
-                   print(f"DEBUG choco: {app.display_name} -> {version}")
-                    version_callback(app.display_name, 'choco', version)
-            except Exception as e:
-                print(f"DEBUG EXCEPTION: {app.display_name} {provider}: {e}")
-                version_callback(app.display_name, provider, f"Error: {str(e)[:15]}")
+        # Start parallel fetch (non-blocking)
+        self.catalog.fetch_all_versions_async(version_callback)
 
-        # Display cached versions first
-        self.root.after_idle(self._display_cached_versions)
-
-        tasks = []
-        for app in self.catalog.apps:
-            if app.winget_id:
-                tasks.append((app, 'winget'))
-            if app.choco_id:
-                tasks.append((app, 'choco'))
-
-        if not tasks:
-            return
-
-        for app, provider in tasks:
-            thread = threading.Thread(target=fetch_one, args=(app, provider), daemon=True)
-            thread.start()
-            
-    def _display_cached_versions(self):
-        """Display already‑cached versions immediately (if any)."""
-        for app in self.catalog.apps:
-            # If any version is cached, refresh the row
-            if app._winget_version or app._choco_version or app.offline_version:
-                self._refresh_app_row(app)
-                
     def _update_single_version(self, display_name, provider, version):
-        """Update the version display for an app when fetched asynchronously."""
-        app = self.catalog.get_app(display_name)
-        if app:
-            self._refresh_app_row(app)
-            
+        """Update one version label in the UI."""
+        if display_name in self.version_labels:
+            labels = self.version_labels[display_name]
+            if provider == 'winget':
+                labels['winget'].config(text=version)
+            elif provider == 'choco':
+                labels['choco'].config(text=version)
+                
     def _refresh_versions(self):
         self._fetch_versions_background()
 
-    def _build_cell_text(self, app, provider):
-        """Build the display text for a provider column (checkbox + version)."""
-        # Check availability
-        if provider == 'offline':
-            available = app.is_offline_available and app.offline_path
-        elif provider == 'winget':
-            available = bool(app.winget_id)
-        elif provider == 'choco':
-            available = bool(app.choco_id)
-        else:
-            return "‑"
-
-        if not available:
-            return "‑"
-
-        # Determine if selected
-        selected = (app.selected_provider == provider)
-
-        # Get version string
-        if provider == 'offline':
-            version = app.offline_version or ""
-        elif provider == 'winget':
-            version = app._winget_version if app._winget_version else ""
-        elif provider == 'choco':
-            version = app._choco_version if app._choco_version else ""
-
-        checkbox = "☑" if selected else "☐"
-        if version:
-            return f"{checkbox} {version}"
-        else:
-            return checkbox
-
-    def _refresh_app_row(self, app):
-        """Update the treeview row for a specific app with current data."""
-        if app.display_name not in self.app_tree_items:
-            return
-        item = self.app_tree_items[app.display_name]
-        # Build new cell texts
-        offline_text = self._build_cell_text(app, 'offline')
-        winget_text = self._build_cell_text(app, 'winget')
-        choco_text = self._build_cell_text(app, 'choco')
-        # Update values (keep name, category, type unchanged)
-        values = list(self.tree_apps.item(item, 'values'))
-        values[3] = offline_text
-        values[4] = winget_text
-        values[5] = choco_text
-        self.tree_apps.item(item, values=values)
-
-    def _on_app_click(self, event):
-        """Handle clicks on the Apps treeview to toggle provider checkboxes."""
-        region = self.tree_apps.identify_region(event.x, event.y)
-        if region != 'cell':
-            return
-        column = self.tree_apps.identify_column(event.x)
-        col_index = int(column[1:]) - 1  # columns are '#1', '#2'...
-        # Only care about columns 3 (offline), 4 (winget), 5 (choco)
-        if col_index < 3:
-            return
-        item = self.tree_apps.identify_row(event.y)
-        if not item:
-            return
-        values = self.tree_apps.item(item, 'values')
-        if not values:
-            return
-        app_name = values[0]
-        app = self.catalog.get_app(app_name)
-        if not app:
-            return
-
-        provider_map = {3: 'offline', 4: 'winget', 5: 'choco'}
-        provider = provider_map.get(col_index)
-        if not provider:
-            return
-
-        # Check if the provider is available
-        if provider == 'offline':
-            available = app.is_offline_available and app.offline_path
-        elif provider == 'winget':
-            available = bool(app.winget_id)
-        elif provider == 'choco':
-            available = bool(app.choco_id)
-        else:
-            available = False
-
-        if not available:
-            return
-
-        # Toggle: if already selected, unselect; else set this provider
-        if app.selected_provider == provider:
-            app.selected_provider = None
-        else:
-            app.selected_provider = provider
-
-        # Update the row
-        self._refresh_app_row(app)
-        return "break"  # Prevent default selection behavior
-        
+    def _display_cached_versions(self):
+        """Display already-cached versions immediately (if any)."""
+        for app in self.catalog.apps:
+            if app.display_name in self.version_labels:
+                labels = self.version_labels[app.display_name]
+                if app.winget_id:
+                    ver = app._winget_version
+                    if ver:
+                        labels['winget'].config(text=ver)
+                if app.choco_id:
+                    ver = app._choco_version
+                    if ver:
+                        labels['choco'].config(text=ver)
+                        
     # ------------------ Backup/Restore Tab (New) ------------------
     # ------------------ Backup/Restore Tab (Updated) ------------------
     def _build_backup_tab(self):
@@ -547,27 +504,32 @@ class DeploymentGUI:
         ttk.Button(top_frame, text="Refresh List", command=self._refresh_backup_list).pack(side=tk.LEFT, padx=2)
 
         # === MIDDLE: Sources List with checkboxes ===
+        sources_label_frame = ttk.Frame(frame)
+        sources_label_frame.pack(fill=tk.X, padx=5, pady=(5,0))
+        ttk.Label(sources_label_frame, text="Backup Sources:").pack(anchor='w')
+
         sources_container = ttk.Frame(frame)
         sources_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Create Treeview
-        columns = ('select', 'source')
-        self.tree_backup = ttk.Treeview(sources_container, columns=columns, show='headings', height=6)
-        self.tree_backup.heading('select', text='')
-        self.tree_backup.heading('source', text='Source Path')
-        self.tree_backup.column('select', width=50, anchor='center', stretch=False)
-        self.tree_backup.column('source', width=400, anchor='w', stretch=True)
+        sources_canvas = tk.Canvas(sources_container, height=120, highlightthickness=0, bg='white')
+        sources_scrollbar = ttk.Scrollbar(sources_container, orient="vertical", command=sources_canvas.yview)
+        self.sources_check_frame = tk.Frame(sources_canvas, bg='white')
 
-        scrollbar = ttk.Scrollbar(sources_container, orient="vertical", command=self.tree_backup.yview)
-        self.tree_backup.configure(yscrollcommand=scrollbar.set)
-        self.tree_backup.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.sources_check_frame.bind(
+            "<Configure>",
+            lambda e: sources_canvas.configure(scrollregion=sources_canvas.bbox("all"))
+        )
+        sources_canvas.create_window((0, 0), window=self.sources_check_frame, anchor="nw")
+        sources_canvas.configure(yscrollcommand=sources_scrollbar.set)
 
-        # Bind click event
-        self.tree_backup.bind('<Button-1>', self._on_backup_click)
+        sources_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sources_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Clear cache
-        self.backup_tree_items = {}
+        # Store checkbox variables and widgets
+        self.source_vars = []
+        self.source_checkboxes = []
+        self.special_source_vars = []
+        self.special_checkboxes = []
 
         # === BOTTOM: Available Backups Dropdown + Buttons ===
         bottom_frame = ttk.Frame(frame)
@@ -609,26 +571,38 @@ class DeploymentGUI:
             self._refresh_backup_list()
 
     def _refresh_sources_list(self):
-        """Rebuild the Backup sources Treeview."""
-        # Clear tree
-        for item in self.tree_backup.get_children():
-            self.tree_backup.delete(item)
-        self.backup_tree_items.clear()
+        """Rebuild the sources list with checkboxes, showing special sources at the top."""
+        # Clear existing checkboxes
+        for widget in self.sources_check_frame.winfo_children():
+            widget.destroy()
 
-        # 1. Special sources (always shown, protected)
+        self.source_vars = []
+        self.source_checkboxes = []
+        self.special_source_vars = []
+        self.special_checkboxes = []
+
+        # 1. Special sources FIRST (always shown, protected) – use expandvars for correct path
         special_sources = [
             ('⭐ Custom Scripts', os.path.expandvars('%SystemDrive%\\Scripts'), 'custom_scripts'),
             ('⭐ PowerTools', os.path.expandvars('%SystemDrive%\\PowerTools'), 'powertools')
         ]
         for display, src_path, subfolder in special_sources:
-            item = self.tree_backup.insert('', tk.END, values=("☑", display), tags=('special',))
-            self.backup_tree_items[src_path] = {'item': item, 'special': True, 'subfolder': subfolder}
+            var = tk.BooleanVar(value=True)
+            cb = tk.Checkbutton(self.sources_check_frame, text=display, variable=var,
+                                bg='white', highlightthickness=0, anchor='w')
+            cb.pack(fill=tk.X, padx=2, pady=1, anchor='w')
+            self.special_source_vars.append((display, src_path, subfolder, var))
+            self.special_checkboxes.append(cb)
 
         # 2. User sources (from backup_engine.sources)
         for src in self.backup_engine.sources:
-            item = self.tree_backup.insert('', tk.END, values=("☑", src), tags=('user',))
-            self.backup_tree_items[src] = {'item': item, 'special': False}
-            
+            var = tk.BooleanVar(value=True)
+            cb = tk.Checkbutton(self.sources_check_frame, text=src, variable=var,
+                                bg='white', highlightthickness=0, anchor='w')
+            cb.pack(fill=tk.X, padx=2, pady=1, anchor='w')
+            self.source_vars.append(var)
+            self.source_checkboxes.append(cb)
+
     def _add_source(self):
         from tkinter import filedialog
         path = filedialog.askdirectory()
@@ -636,44 +610,36 @@ class DeploymentGUI:
             converted = self.backup_engine._convert_to_env_var(path)
             self.backup_engine.add_source(converted)
             self._refresh_sources_list()
-            
+
     def _remove_selected_sources(self):
         """Remove unchecked user sources. Special sources are protected."""
-        to_remove = []
-        for src_path, info in self.backup_tree_items.items():
-            if info['special']:
-                continue
-            item = info['item']
-            values = self.tree_backup.item(item, 'values')
-            if not values or values[0] == "☐":
-                to_remove.append(src_path)
-
-        if not to_remove:
-            messagebox.showinfo("Info", "No user sources are unchecked. To remove a source, uncheck it first, then click 'Remove'.")
+        if not self.source_vars:
             return
-
+        to_remove = []
+        for i, var in enumerate(self.source_vars):
+            if not var.get():
+                to_remove.append(i)
+        if not to_remove:
+            messagebox.showinfo("Info", "No user sources are unchecked. To remove a source, uncheck it first, then click 'Remove Source'.")
+            return
         if messagebox.askyesno("Confirm Remove", f"Remove {len(to_remove)} unchecked user source(s)?"):
-            for src in to_remove:
+            for i in reversed(to_remove):
+                src = self.backup_engine.sources[i]
                 self.backup_engine.remove_source(src)
             self._refresh_sources_list()
-            
+
     def _select_all_sources(self):
-        for item in self.tree_backup.get_children():
-            values = self.tree_backup.item(item, 'values')
-            if values:
-                self.tree_backup.item(item, values=("☑", values[1]))
-                
+        for var in self.source_vars:
+            var.set(True)
+        for _, _, _, var in self.special_source_vars:
+            var.set(True)
+
     def _select_none_sources(self):
-        for item in self.tree_backup.get_children():
-            tags = self.tree_backup.item(item, 'tags')
-            if 'special' in tags:
-                # Special sources always remain checked
-                self.tree_backup.item(item, values=("☑", self.tree_backup.item(item, 'values')[1]))
-            else:
-                values = self.tree_backup.item(item, 'values')
-                if values:
-                    self.tree_backup.item(item, values=("☐", values[1]))
-                    
+        for var in self.source_vars:
+            var.set(False)
+        for _, _, _, var in self.special_source_vars:
+            var.set(False)
+
     def _browse_dest(self):
         from tkinter import filedialog
         path = filedialog.askdirectory()
@@ -709,16 +675,15 @@ class DeploymentGUI:
         """Create backups: user sources in one archive, special sources separately in subfolders."""
         # Collect checked user sources
         user_sources = []
+        for i, var in enumerate(self.source_vars):
+            if var.get():
+                user_sources.append(self.backup_engine.sources[i])
+
+        # Collect checked special sources
         special_sources = []
-        for src_path, info in self.backup_tree_items.items():
-            item = info['item']
-            values = self.tree_backup.item(item, 'values')
-            if not values or values[0] != "☑":
-                continue
-            if info['special']:
-                special_sources.append((src_path, info['subfolder']))
-            else:
-                user_sources.append(src_path)
+        for display, src_path, subfolder, var in self.special_source_vars:
+            if var.get():
+                special_sources.append((src_path, subfolder))
 
         if not user_sources and not special_sources:
             messagebox.showwarning("No Sources Selected", "No backup sources are checked. Please select at least one source.")
@@ -750,14 +715,13 @@ class DeploymentGUI:
                     self.log_text_insert(f"Backup of {os.path.basename(src_path)} failed: {msg}\n")
 
             self.root.config(cursor="")
+            # Only refresh the backup list – preserve source selection
             self._refresh_backup_list()
+            # DO NOT call _refresh_sources_list() – it resets selections
 
         threading.Thread(target=task, daemon=True).start()
-        
-    def _do_restore(self):
-        import zipfile
-        import shutil
 
+    def _do_restore(self):
         selected = self.backup_combo.get()
         if not selected:
             messagebox.showinfo("No Backup", "No backup selected in the dropdown.")
@@ -767,38 +731,21 @@ class DeploymentGUI:
             messagebox.showerror("Error", "Backup file not found.")
             return
 
+        # Determine sources to restore based on checkbox
         restore_selected_only = self.restore_selected_only_var.get()
-
-        # Determine sources to restore
-        user_sources_to_restore = None  # None = restore all user sources
-        special_sources_to_restore = []
-
+        sources_to_restore = None
         if restore_selected_only:
-            checked_user = []
-            checked_special = []
-            for src_path, info in self.backup_tree_items.items():
-                item = info['item']
-                values = self.tree_backup.item(item, 'values')
-                if not values or values[0] != "☑":
-                    continue
-                if info['special']:
-                    checked_special.append((src_path, info['subfolder']))
-                else:
-                    checked_user.append(src_path)
-
-            if not checked_user and not checked_special:
+            # Gather checked user sources
+            checked_sources = []
+            for i, var in enumerate(self.source_vars):
+                if var.get():
+                    checked_sources.append(self.backup_engine.sources[i])
+            if not checked_sources:
                 messagebox.showwarning("No Sources Selected", 
-                                       "No sources are checked. Please select at least one source to restore.")
+                                       "No user sources are checked. Please select at least one source to restore.")
                 return
-
-            user_sources_to_restore = checked_user if checked_user else []
-            special_sources_to_restore = checked_special
-        else:
-            # Restore all user sources (None) and all special sources
-            special_sources_to_restore = [
-                (os.path.expandvars('%SystemDrive%\\Scripts'), 'custom_scripts'),
-                (os.path.expandvars('%SystemDrive%\\PowerTools'), 'powertools')
-            ]
+            sources_to_restore = checked_sources
+        # else: sources_to_restore remains None -> restore all
 
         if not messagebox.askyesno("Confirm Restore", 
                                    f"Restore from '{selected}'?\nThis will overwrite existing files for the selected sources."):
@@ -807,103 +754,14 @@ class DeploymentGUI:
         def task():
             self.root.config(cursor="watch")
             self.log_text_insert(f"Restoring from {selected}...\n")
-
-            # 1. Restore root backup (user sources)
-            if user_sources_to_restore is not None:
-                if user_sources_to_restore:  # non-empty list
-                    success, msg = self.backup_engine.restore_backup(zip_path, sources_to_restore=user_sources_to_restore)
-                else:
-                    # empty list means restore nothing from root
-                    success = True
-                    msg = "No user sources selected for restore."
-            else:
-                # restore all user sources
-                success, msg = self.backup_engine.restore_backup(zip_path, sources_to_restore=None)
-
+            success, msg = self.backup_engine.restore_backup(zip_path, sources_to_restore=sources_to_restore)
             if success:
-                self.log_text_insert("Root backup restored successfully.\n")
+                self.log_text_insert("Restore completed successfully.\n")
             else:
-                self.log_text_insert(f"Root backup restore failed: {msg}\n")
-
-            # 2. Restore special sources manually using zipfile
-            for src_path, subfolder in special_sources_to_restore:
-                subfolder_path = os.path.join(self.backup_engine.destination_dir, subfolder)
-                if not os.path.isdir(subfolder_path):
-                    self.log_text_insert(f"No backup found for {os.path.basename(src_path)} in {subfolder}/. Skipping.\n")
-                    continue
-                # Find the latest zip in the subfolder
-                zip_files = [f for f in os.listdir(subfolder_path) if f.endswith('.zip')]
-                if not zip_files:
-                    self.log_text_insert(f"No backup found for {os.path.basename(src_path)} in {subfolder}/. Skipping.\n")
-                    continue
-                zip_files.sort(key=lambda x: os.path.getmtime(os.path.join(subfolder_path, x)), reverse=True)
-                special_zip = os.path.join(subfolder_path, zip_files[0])
-
-                self.log_text_insert(f"Restoring {os.path.basename(src_path)} from {special_zip}...\n")
-                try:
-                    # Ensure the target folder exists
-                    if not os.path.isdir(src_path):
-                        os.makedirs(src_path, exist_ok=True)
-
-                    with zipfile.ZipFile(special_zip, 'r') as zf:
-                        # Extract to temp folder to handle top-level folder structure
-                        temp_dir = os.path.join(self.backup_engine.destination_dir, '_temp_extract')
-                        os.makedirs(temp_dir, exist_ok=True)
-                        zf.extractall(temp_dir)
-
-                        # Determine the root folder in the temp extraction
-                        extracted_items = os.listdir(temp_dir)
-                        # If only one folder, assume it's the top-level (e.g., 'Scripts')
-                        if len(extracted_items) == 1 and os.path.isdir(os.path.join(temp_dir, extracted_items[0])):
-                            top_folder = os.path.join(temp_dir, extracted_items[0])
-                            # Copy the contents of top_folder to src_path
-                            for item in os.listdir(top_folder):
-                                src_item = os.path.join(top_folder, item)
-                                dst_item = os.path.join(src_path, item)
-                                if os.path.isdir(src_item):
-                                    shutil.copytree(src_item, dst_item, dirs_exist_ok=True)
-                                else:
-                                    shutil.copy2(src_item, dst_item)
-                        else:
-                            # No top-level folder, copy all files/folders from temp_dir to src_path
-                            for item in extracted_items:
-                                src_item = os.path.join(temp_dir, item)
-                                dst_item = os.path.join(src_path, item)
-                                if os.path.isdir(src_item):
-                                    shutil.copytree(src_item, dst_item, dirs_exist_ok=True)
-                                else:
-                                    shutil.copy2(src_item, dst_item)
-
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-                        self.log_text_insert(f"{os.path.basename(src_path)} restored successfully.\n")
-                except Exception as e:
-                    self.log_text_insert(f"{os.path.basename(src_path)} restore failed: {str(e)}\n")
-
+                self.log_text_insert(f"Restore failed: {msg}\n")
             self.root.config(cursor="")
-            self.log_text_insert("Restore process completed.\n")
-
         threading.Thread(target=task, daemon=True).start()
-        
-    def _on_backup_click(self, event):
-        """Toggle checkbox in the Backup treeview."""
-        region = self.tree_backup.identify_region(event.x, event.y)
-        if region != 'cell':
-            return
-        column = self.tree_backup.identify_column(event.x)
-        if column != '#1':  # first column is 'select'
-            return
-        item = self.tree_backup.identify_row(event.y)
-        if not item:
-            return
-        # Allow toggling for all items (no special protection)
-        values = self.tree_backup.item(item, 'values')
-        if not values:
-            return
-        current = values[0]
-        new_val = "☑" if current == "☐" else "☐"
-        self.tree_backup.item(item, values=(new_val, values[1]))
-        return "break"  # prevent selection
-        
+
     # ---------- Logging & Status Polling ----------
     def log_text_insert(self, text):
         def _insert():
@@ -961,21 +819,21 @@ class DeploymentGUI:
                 })
         self.install_engine.set_selected_activators(selected_activators)
 
+        # ... existing code to get selected_activators ...
+
         # Gather external scripts
         ext_scripts = self.get_checked_external_scripts()
         self.install_engine.set_external_scripts(ext_scripts)
 
+        # ... rest ...
+
         # Gather restore sources (if "Restore selected only" is checked)
         if self.restore_selected_only_var.get():
-            # Get checked user sources from backup tree
+            # Get checked user sources
             checked_sources = []
-            for src_path, info in self.backup_tree_items.items():
-                if info['special']:
-                    continue  # special sources are not in the main backup zip
-                item = info['item']
-                values = self.tree_backup.item(item, 'values')
-                if values and values[0] == "☑":
-                    checked_sources.append(src_path)
+            for i, var in enumerate(self.source_vars):
+                if var.get():
+                    checked_sources.append(self.backup_engine.sources[i])
             self.install_engine.restore_sources = checked_sources if checked_sources else None
         else:
             self.install_engine.restore_sources = None
@@ -989,7 +847,7 @@ class DeploymentGUI:
         self.install_engine.set_operations(self.selected_operations)
         self.install_engine.start_deployment(on_finished=self._deployment_finished)
         self._update_status_panel()
-        
+
     def _enable_ui(self):
         self.btn_deploy.config(state=tk.NORMAL)
         self.btn_cancel.config(state=tk.DISABLED)

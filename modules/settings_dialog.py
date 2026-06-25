@@ -53,12 +53,64 @@ class SettingsDialog:
         btn_frame.pack(fill=tk.X, padx=5, pady=5)
         ttk.Button(btn_frame, text="Close", command=self.dialog.destroy).pack(side=tk.RIGHT, padx=5)
 
-    # ---------- Helper Dialogs ----------
+    # ---------- Helper: Drag‑and‑Drop for Treeviews ----------
+    def _make_draggable(self, tree, data_list, key_func, save_func):
+        """
+        Make Treeview rows draggable to reorder data_list.
+        tree: ttk.Treeview
+        data_list: list of items (objects or dicts)
+        key_func: callable(item) -> str (unique key)
+        save_func: callable() to save the config after reordering
+        """
+        drag_data = {"item": None, "index": None}
+
+        def on_press(event):
+            item = tree.identify_row(event.y)
+            if not item:
+                return
+            tree.selection_set(item)
+            drag_data["item"] = item
+            drag_data["index"] = tree.index(item)
+
+        def on_motion(event):
+            if not drag_data["item"]:
+                return
+            dest_item = tree.identify_row(event.y)
+            if not dest_item or dest_item == drag_data["item"]:
+                return
+            dest_index = tree.index(dest_item)
+            tree.move(drag_data["item"], "", dest_index)
+            drag_data["index"] = dest_index
+
+        def on_release(event):
+            if not drag_data["item"]:
+                return
+            # Get new order of keys from tree (first column)
+            new_order = []
+            for child in tree.get_children():
+                values = tree.item(child, 'values')
+                if values:
+                    new_order.append(values[0])
+            # Reorder data_list to match new_order
+            key_to_item = {key_func(item): item for item in data_list}
+            reordered = []
+            for key in new_order:
+                if key in key_to_item:
+                    reordered.append(key_to_item.pop(key))
+            # Append remaining items (safety)
+            reordered.extend(key_to_item.values())
+            # Update data_list in place
+            data_list.clear()
+            data_list.extend(reordered)
+            save_func()
+            drag_data["item"] = None
+
+        tree.bind("<Button-1>", on_press)
+        tree.bind("<B1-Motion>", on_motion)
+        tree.bind("<ButtonRelease-1>", on_release)
+
+    # ---------- Helper: Show URL Dialog ----------
     def _show_url_dialog(self, title, current_url=""):
-        """
-        Display a simple dialog asking for a download URL.
-        Returns the new URL (or None if cancelled).
-        """
         dialog = tk.Toplevel(self.dialog)
         dialog.title(title)
         dialog.geometry("450x120")
@@ -70,7 +122,7 @@ class SettingsDialog:
         entry = ttk.Entry(dialog, textvariable=url_var, width=50)
         entry.pack(padx=10, pady=5, fill=tk.X)
 
-        result = [None]  # use list to hold return value
+        result = [None]
 
         def on_ok():
             result[0] = url_var.get().strip()
@@ -84,7 +136,6 @@ class SettingsDialog:
         ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
 
-        # Center and wait
         dialog.update_idletasks()
         width = dialog.winfo_width()
         height = dialog.winfo_height()
@@ -95,6 +146,115 @@ class SettingsDialog:
 
         return result[0]
 
+    # ---------- Helper: Test Package ID ----------
+    def _test_package_id(self, provider, package_id):
+        """
+        Test if a package ID exists in Winget or Chocolatey.
+        Returns (success, message, version) where version is the latest version string or None.
+        """
+        if not package_id:
+            return False, "Package ID is empty", None
+
+        try:
+            if provider == 'winget':
+                cmd = f"winget show {package_id}"
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',      # <-- ADDED
+                    errors='ignore',       # <-- ADDED
+                    timeout=30
+                )
+                if result.returncode == 0:
+                    version = None
+                    for line in result.stdout.split('\n'):
+                        if 'Version' in line and ':' in line:
+                            version = line.split(':', 1)[1].strip()
+                            break
+                    if version:
+                        return True, f"Winget Found: {version}", version
+                    else:
+                        return True, "Package found (no version info)", None
+                else:
+                    error = result.stderr.strip() or result.stdout.strip()
+                    if "not found" in error.lower() or "no such" in error.lower():
+                        return False, "Package not found", None
+                    else:
+                        return False, f"Error: {error[:80]}", None
+            elif provider == 'choco':
+                cmd = f"choco find {package_id} --exact --limit-output"
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',      # <-- ADDED
+                    errors='ignore',       # <-- ADDED
+                    timeout=30
+                )
+                if result.returncode == 0:
+                    version = None
+                    for line in result.stdout.split('\n'):
+                        if '|' in line:
+                            parts = line.split('|')
+                            if len(parts) >= 2:
+                                version = parts[1].strip()
+                                break
+                    if version:
+                        return True, f"Choco Found: {version}", version
+                    else:
+                        return True, "Package found (no version info)", None
+                else:
+                    error = result.stderr.strip() or result.stdout.strip()
+                    if "not found" in error.lower() or "no such" in error.lower():
+                        return False, "Package not found", None
+                    else:
+                        return False, f"Error: {error[:80]}", None
+            else:
+                return False, f"Unknown provider: {provider}", None
+        except subprocess.TimeoutExpired:
+            return False, "Timeout (package query took too long)", None
+        except FileNotFoundError:
+            return False, f"{provider.capitalize()} not installed", None
+        except Exception as e:
+            return False, f"Exception: {str(e)[:80]}", None
+            
+    def _test_package_id_ui(self, provider, package_id, status_label):
+        """Test a package ID and update the status label."""
+        if not package_id:
+            try:
+                status_label.config(text="Please enter a package ID", foreground="orange")
+            except tk.TclError:
+                pass
+            return
+
+        # Show checking message immediately
+        try:
+            status_label.config(text=f"⏳ Checking {provider}...", foreground="blue")
+        except tk.TclError:
+            pass
+
+        def run_test():
+            success, msg, version = self._test_package_id(provider, package_id)
+            # Schedule UI update on the main thread
+            def update_label():
+                try:
+                    if status_label.winfo_exists():
+                        if success:
+                            status_label.config(text=f"✅ {msg}", foreground="green")
+                        else:
+                            status_label.config(text=f"❌ {msg}", foreground="red")
+                except tk.TclError:
+                    pass
+            try:
+                self.dialog.after_idle(update_label)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=run_test, daemon=True).start()
+        
     # ---------- App Management Tab ----------
     def _build_apps_tab(self):
         frame = self.tab_apps
@@ -104,6 +264,14 @@ class SettingsDialog:
             self.tree_apps.heading(col, text=col)
             self.tree_apps.column(col, width=100)
         self.tree_apps.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Make Apps tree draggable
+        self._make_draggable(
+            self.tree_apps,
+            self.catalog.apps,
+            lambda app: app.display_name,
+            self.catalog._save_apps_to_config
+        )
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -155,13 +323,6 @@ class SettingsDialog:
             self._refresh_apps_list()
 
     def _download_app(self, display_name, url=None, show_dialog=True, callback=None):
-        """
-        Core function to download an offline installer for an app.
-        If show_dialog is True, ask the user to confirm/edit the URL.
-        If callback is provided, it is called with the new offline_path after successful download.
-        Returns True on success, False on failure/cancel.
-        """
-        # 1. Get/confirm URL
         app = self.catalog.get_app(display_name)
         if not app and not url:
             messagebox.showerror("Error", "App not found and no URL provided.")
@@ -171,7 +332,7 @@ class SettingsDialog:
         if show_dialog:
             new_url = self._show_url_dialog(f"Download URL for {display_name}", current_url)
             if new_url is None:
-                return False  # cancelled
+                return False
             if new_url != current_url:
                 current_url = new_url
         else:
@@ -179,24 +340,20 @@ class SettingsDialog:
                 messagebox.showerror("Error", "Download URL is empty.")
                 return False
 
-        # 2. Ensure app exists in catalog (if not, create temporary entry)
         temp_app = None
         if not app:
-            # Create temporary app entry with the URL
             temp_data = {
                 'display_name': display_name,
                 'offline_download_url': current_url,
-                'offline_path': ''  # will be set after download
+                'offline_path': ''
             }
             temp_app = self.catalog.add_app(temp_data)
             app = temp_app
         else:
-            # Update URL if changed
             if current_url != app.offline_download_url:
                 app.offline_download_url = current_url
                 self.catalog._save_apps_to_config()
 
-        # 3. Download with progress
         progress_dlg = tk.Toplevel(self.dialog)
         progress_dlg.title("Downloading...")
         progress_dlg.geometry("300x80")
@@ -213,23 +370,18 @@ class SettingsDialog:
             progress_dlg.destroy()
             if success:
                 messagebox.showinfo("Success", f"Download of {display_name} completed.")
-                # Update the app's offline path (it's set in the catalog)
                 app_after = self.catalog.get_app(display_name)
                 if callback and app_after:
                     callback(app_after.offline_path)
                 self._refresh_apps_list()
-                # If it was a temporary app, we can remove it after the callback
                 if temp_app:
-                    # The callback already used the path; now we can remove the temporary entry
                     self.catalog.delete_app(display_name)
             else:
                 messagebox.showerror("Download Failed", msg)
-                # Clean up temporary app on failure
                 if temp_app:
                     self.catalog.delete_app(display_name)
 
         threading.Thread(target=do_download, daemon=True).start()
-        # Return True immediately; actual success is shown in callback.
         return True
 
     def _sanitize_folder_name(self, name):
@@ -305,13 +457,12 @@ class SettingsDialog:
     def _edit_app_dialog(self, app):
         dialog = tk.Toplevel(self.dialog)
         dialog.title("Edit App" if app else "Add App")
-        dialog.geometry("500x520")  # increased height for extra row
+        dialog.geometry("500x560")  # taller for status label
         dialog.transient(self.dialog)
         dialog.grab_set()
 
         dialog.columnconfigure(0, weight=0)
         dialog.columnconfigure(1, weight=1)
-
 
         display_var = tk.StringVar()
         category_var = tk.StringVar()
@@ -379,14 +530,24 @@ class SettingsDialog:
         ttk.Entry(dialog, textvariable=download_url_var).grid(row=row, column=1, padx=(5,10), pady=2, sticky='we')
         row += 1
 
-        # Winget ID
+        # Winget ID with Test button
         ttk.Label(dialog, text="Winget ID:").grid(row=row, column=0, sticky='e', padx=5, pady=2)
-        ttk.Entry(dialog, textvariable=winget_var).grid(row=row, column=1, padx=(5,10), pady=2, sticky='we')
+        winget_frame = ttk.Frame(dialog)
+        winget_frame.grid(row=row, column=1, padx=(5,10), pady=2, sticky='we')
+        winget_entry = ttk.Entry(winget_frame, textvariable=winget_var)
+        winget_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(winget_frame, text="Test",
+                   command=lambda: self._test_package_id_ui('winget', winget_var.get().strip(), status_label)).pack(side=tk.LEFT, padx=2)
         row += 1
 
-        # Choco ID
+        # Choco ID with Test button
         ttk.Label(dialog, text="Choco ID:").grid(row=row, column=0, sticky='e', padx=5, pady=2)
-        ttk.Entry(dialog, textvariable=choco_var).grid(row=row, column=1, padx=(5,10), pady=2, sticky='we')
+        choco_frame = ttk.Frame(dialog)
+        choco_frame.grid(row=row, column=1, padx=(5,10), pady=2, sticky='we')
+        choco_entry = ttk.Entry(choco_frame, textvariable=choco_var)
+        choco_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(choco_frame, text="Test",
+                   command=lambda: self._test_package_id_ui('choco', choco_var.get().strip(), status_label)).pack(side=tk.LEFT, padx=2)
         row += 1
 
         # Install Type
@@ -394,6 +555,11 @@ class SettingsDialog:
         install_types = ['silent', 'non_silent', 'driver', 'script', 'redist']
         install_combo = ttk.Combobox(dialog, textvariable=install_type_var, values=install_types, state='readonly')
         install_combo.grid(row=row, column=1, padx=(5,10), pady=2, sticky='we')
+        row += 1
+
+        # Status label for test results
+        status_label = ttk.Label(dialog, text="", foreground="blue")
+        status_label.grid(row=row, column=0, columnspan=2, sticky='w', padx=5, pady=2)
         row += 1
 
         # Post-Install Script
@@ -405,11 +571,10 @@ class SettingsDialog:
         ttk.Button(post_frame, text="Browse...", command=lambda: self._browse_post_install_script(post_install_path_var)).pack(side=tk.LEFT, padx=2)
         row += 1
 
-        # --- BUTTONS: Test Installer & Download Now ---
+        # Action buttons: Test Installer & Download Now
         action_frame = ttk.Frame(dialog)
         action_frame.grid(row=row, column=0, columnspan=2, pady=10)
-        action_frame.columnconfigure(0, weight=1)  # push buttons to left
-
+        action_frame.columnconfigure(0, weight=1)
 
         ttk.Button(action_frame, text="Test Installer",
                    command=lambda: self._test_offline_installer(offline_path_var, offline_switch_var)) \
@@ -432,7 +597,6 @@ class SettingsDialog:
         ttk.Label(download_btn_frame, text="(uses URL above)", foreground="gray").pack(side=tk.LEFT, padx=5)
         row += 1
 
-
         def save():
             data = {
                 'display_name': display_var.get().strip(),
@@ -450,7 +614,7 @@ class SettingsDialog:
                 messagebox.showerror("Error", "Display name is required")
                 return
 
-            # --- Copy offline installer ---
+            # Copy offline installer
             offline_path = data['offline_path']
             if offline_path and os.path.isabs(offline_path) and offline_path != original_offline_path:
                 if os.path.isfile(offline_path):
@@ -472,7 +636,7 @@ class SettingsDialog:
                     if not messagebox.askyesno("File Not Found", f"The file '{offline_path}' does not exist. Continue saving?"):
                         return
 
-            # --- Copy post-install script ---
+            # Copy post-install script
             post_script = data['post_install_script']
             if post_script and os.path.isabs(post_script) and os.path.isfile(post_script) and post_script != original_post_install_path:
                 try:
@@ -486,7 +650,6 @@ class SettingsDialog:
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to copy post-install script: {e}")
             elif post_script and os.path.isabs(post_script) and post_script == original_post_install_path:
-                # keep as is (might be relative already)
                 pass
 
             if app:
@@ -504,7 +667,6 @@ class SettingsDialog:
                 self._refresh_apps_list()
                 dialog.destroy()
 
-        # --- Save / Cancel buttons (unchanged) ---
         btn_frame = ttk.Frame(dialog)
         btn_frame.grid(row=row, column=0, columnspan=2, pady=10)
         ttk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=5)
@@ -577,7 +739,7 @@ class SettingsDialog:
         self.config.save_settings()
         messagebox.showinfo("Saved", "Operations configuration saved.")
 
-    # ---------- Tweaks Tab ----------
+    # ---------- Tweaks Management Tab ----------
     def _build_tweaks_tab(self):
         frame = self.tab_tweaks
 
@@ -594,6 +756,15 @@ class SettingsDialog:
         self.tree_tweaks.column('category', width=120)
 
         self.tree_tweaks.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Get tweaks list and make it draggable
+        tweaks_list = self.config.tweaks.get('tweaks', [])
+        self._make_draggable(
+            self.tree_tweaks,
+            tweaks_list,
+            lambda t: t.get('name', ''),
+            self.config.save_tweaks
+        )
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -662,11 +833,10 @@ class SettingsDialog:
     def _edit_tweak_dialog(self, tweak):
         dialog = tk.Toplevel(self.dialog)
         dialog.title("Edit Tweak" if tweak else "Add Tweak")
-        dialog.geometry("500x450")  # slightly taller
+        dialog.geometry("500x450")
         dialog.transient(self.dialog)
         dialog.grab_set()
 
-        # Allow horizontal stretching
         dialog.columnconfigure(0, weight=0)
         dialog.columnconfigure(1, weight=1)
 
@@ -676,7 +846,7 @@ class SettingsDialog:
         script_type_var = tk.StringVar(value='ps1')
         enable_var = tk.StringVar()
         disable_var = tk.StringVar()
-        args_var = tk.StringVar()   # <-- added
+        args_var = tk.StringVar()
 
         if tweak:
             name_var.set(tweak.get('name', ''))
@@ -685,7 +855,7 @@ class SettingsDialog:
             script_type_var.set(tweak.get('script_type', 'ps1'))
             enable_var.set(tweak.get('enable_script', ''))
             disable_var.set(tweak.get('disable_script', ''))
-            args_var.set(tweak.get('arguments', ''))   # <-- added
+            args_var.set(tweak.get('arguments', ''))
 
         row = 0
 
@@ -703,7 +873,7 @@ class SettingsDialog:
         cat_combo.grid(row=row, column=1, padx=(5,10), pady=2, sticky='we')
         row += 1
 
-        # Description (multiline) – we keep the frame but ensure it stretches
+        # Description
         ttk.Label(dialog, text="Description:").grid(row=row, column=0, sticky='ne', padx=5, pady=2)
         desc_frame = ttk.Frame(dialog)
         desc_frame.grid(row=row, column=1, padx=(5,10), pady=2, sticky='we')
@@ -748,13 +918,11 @@ class SettingsDialog:
         self._update_script_preview(disable_var, disable_preview)
         row += 1
 
-        # Test Script button (stays left)
+        # Test Script
         ttk.Button(dialog, text="Test Script",
                    command=lambda: self._test_tweak_script(enable_var, disable_var, script_type_var, args_var)) \
             .grid(row=row, column=1, sticky='w', padx=(5,10), pady=5)
         row += 1
-
-        # ... save and cancel buttons (unchanged) ...
 
         def save_tweak():
             description = desc_text.get("1.0", tk.END).strip()
@@ -917,7 +1085,7 @@ class SettingsDialog:
                 if ext in ext_map:
                     script_type_var.set(ext_map[ext])
 
-    # ---------- Activators Tab ----------
+    # ---------- Activators Management Tab ----------
     def _build_activators_tab(self):
         frame = self.tab_activators
         columns = ('Name', 'Category', 'Description', 'Executable', 'Default Switches')
@@ -926,6 +1094,15 @@ class SettingsDialog:
             self.tree_activators.heading(col, text=col)
             self.tree_activators.column(col, width=120)
         self.tree_activators.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Get activators list and make it draggable
+        activators_list = self.config.activators.get('activators', [])
+        self._make_draggable(
+            self.tree_activators,
+            activators_list,
+            lambda a: a.get('name', ''),
+            self.config.save_activators
+        )
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -981,10 +1158,11 @@ class SettingsDialog:
             self.config.save_activators()
             self._refresh_activators_list()
 
+    # ---------- Activators Edit Dialog ----------
     def _edit_activator_dialog(self, activator):
         dialog = tk.Toplevel(self.dialog)
         dialog.title("Edit Activator" if activator else "Add Activator")
-        dialog.geometry("550x400")  # increased height slightly for new row
+        dialog.geometry("550x400")
         dialog.transient(self.dialog)
         dialog.grab_set()
 
@@ -1058,7 +1236,6 @@ class SettingsDialog:
         ttk.Entry(dialog, textvariable=archive_var).grid(row=row, column=1, padx=(5,10), pady=2, sticky='we')
         row += 1
 
-        # New row for the helper label (spanning columns 1 and 2)
         ttk.Label(dialog, text="(Leave empty – auto-generated)", foreground="gray").grid(row=row, column=1, sticky='w', padx=(5,10), pady=(0,5))
         row += 1
 
@@ -1082,7 +1259,7 @@ class SettingsDialog:
         ttk.Entry(dialog, textvariable=github_pattern_var).grid(row=row, column=1, padx=(5,10), pady=2, sticky='we')
         row += 1
 
-        # Download Now button (unchanged)
+        # Download Now button
         download_frame = ttk.Frame(dialog)
         download_frame.grid(row=row, column=0, columnspan=2, pady=5)
         ttk.Button(download_frame, text="Download Now (from URL/GitHub)",
@@ -1161,7 +1338,6 @@ class SettingsDialog:
         ttk.Button(btn_frame, text="Save", command=save_activator).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
 
-
     def _browse_file_for_activator(self, var, mode='file'):
         if mode == 'file':
             filename = filedialog.askopenfilename(title="Select Main Executable",
@@ -1174,12 +1350,6 @@ class SettingsDialog:
                 var.set(folder)
 
     def _download_activator(self, name, activator_dict, show_dialog=True):
-        """
-        Core function to download an activator.
-        If show_dialog is True, ask the user to confirm/edit the URL.
-        Returns True on success, False on failure/cancel.
-        """
-        # 1. Get/confirm URL
         current_url = activator_dict.get('download_url', '')
         if show_dialog:
             new_url = self._show_url_dialog(f"Download URL for {name}", current_url)
@@ -1193,10 +1363,7 @@ class SettingsDialog:
                 messagebox.showerror("Error", "Download URL is empty.")
                 return False
 
-        # 2. Update activator config if changed (only if we have a reference to the real dict)
-        # We need to find the actual activator in the config to persist changes.
-        # If this is called from the management tab, activator_dict is the real dict.
-        # If called from the edit dialog, we pass a temporary dict; we'll update the real one later.
+        # Update real activator in config if it exists
         real_act = None
         for a in self.config.activators.get('activators', []):
             if a.get('name') == name:
@@ -1206,11 +1373,7 @@ class SettingsDialog:
             if current_url != real_act.get('download_url'):
                 real_act['download_url'] = current_url
                 self.config.save_activators()
-        else:
-            # If we are in edit dialog, we don't have a real dict yet; we'll save later.
-            pass
 
-        # 3. Download using ActivatorEngine
         from modules.activator_engine import ActivatorEngine
         engine = ActivatorEngine(self.config)
         download_dict = {
