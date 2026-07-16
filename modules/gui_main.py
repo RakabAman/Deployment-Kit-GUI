@@ -12,6 +12,7 @@ from modules.app_catalog import AppCatalog
 from modules.backup_engine import BackupEngine
 from modules.install_engine import InstallEngine
 from modules.settings_dialog import SettingsDialog
+from modules.profile_manager import ProfileManager
 
 class DeploymentGUI:
     def __init__(self, root, is_admin):
@@ -32,6 +33,7 @@ class DeploymentGUI:
         self.app_tree_items = {}    # <-- ADD THIS
 
         self.backup_tree_items = {}  # source_path -> dict with item, special, subfolder
+        self.profile_manager = ProfileManager(self.config.base_dir)
         
         self._build_ui()
         self._poll_logs()
@@ -68,12 +70,22 @@ class DeploymentGUI:
 
         menubar = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Manage Profiles...",
+                              command=lambda: self.profile_manager.manage_profiles_dialog(
+                                  self.root,
+                                  self._collect_profile_data,
+                                  self._apply_profile_data,
+                                  self.log_text_insert
+                              ))
         file_menu.add_command(label="Exit", command=self.root.quit)
         menubar.add_cascade(label="File", menu=file_menu)
+
 
         settings_menu = tk.Menu(menubar, tearoff=0)
         settings_menu.add_command(label="Settings", command=self._open_settings)
         menubar.add_cascade(label="Settings", menu=settings_menu)
+        
+
 
         self.root.config(menu=menubar)
 
@@ -296,13 +308,16 @@ class DeploymentGUI:
 
         self._refresh_install_tab()
 
-    def _refresh_install_tab(self):
+    def _refresh_install_tab(self, reload_catalog=True):
         """Rebuild the Apps tab using a Treeview with checkboxes."""
         # Clear container
         for widget in self.install_container.winfo_children():
             widget.destroy()
 
-        self.catalog.refresh()
+        if reload_catalog:
+            self.catalog.refresh()
+        # else: keep existing catalog state (used when loading profiles)
+
         search_text = self.search_var.get().strip().lower()
         filter_type = self.filter_var.get().lower()
 
@@ -359,8 +374,9 @@ class DeploymentGUI:
             self.app_tree_items[app.display_name] = item
 
         # Show cached versions if any
-        self._display_cached_versions() 
-
+        self._display_cached_versions()
+        
+        
     def _fetch_versions_background(self):
         """Fetch versions in parallel, updating labels as they arrive."""
         import threading
@@ -383,7 +399,7 @@ class DeploymentGUI:
                         version = app._winget_version
                     else:
                         version = app.get_winget_version()
-                   print(f"DEBUG winget: {app.display_name} -> {version}")
+                    print(f"DEBUG winget: {app.display_name} -> {version}")
                     version_callback(app.display_name, 'winget', version)
                 elif provider == 'choco':
                     if not app.choco_id:
@@ -392,7 +408,7 @@ class DeploymentGUI:
                         version = app._choco_version
                     else:
                         version = app.get_choco_version()
-                   print(f"DEBUG choco: {app.display_name} -> {version}")
+                    print(f"DEBUG choco: {app.display_name} -> {version}")
                     version_callback(app.display_name, 'choco', version)
             except Exception as e:
                 print(f"DEBUG EXCEPTION: {app.display_name} {provider}: {e}")
@@ -1841,3 +1857,199 @@ class DeploymentGUI:
     def get_checked_external_scripts(self):
         """Return list of enabled external scripts."""
         return [s for s in self.external_scripts if s.get('enabled', False)]
+        
+        
+    # ------------------ Profile Management ------------------
+
+    def _collect_profile_data(self):
+        """Return a dict representing the current GUI state."""
+        print("\n--- Saving Profile ---")
+        # Operations order
+        ops = self.selected_operations[:]
+        print(f"Operations order: {ops}")
+
+        # Apps: display_name -> selected_provider (only if selected)
+        apps_state = {}
+        for app in self.catalog.apps:
+            if app.selected_provider is not None:
+                apps_state[app.display_name] = app.selected_provider
+        print(f"Apps state: {apps_state}")
+
+        # Tweaks: name -> selected_action (only if action selected)
+        tweaks_state = {}
+        for tweak in self.config.tweaks.get('tweaks', []):
+            action = tweak.get('selected_action')
+            if action:
+                tweaks_state[tweak['name']] = action
+        print(f"Tweaks state: {tweaks_state}")
+
+        # Activators: name -> {selected, switches}
+        activators_state = {}
+        for item in self.tree_activators.get_children():
+            values = self.tree_activators.item(item, 'values')
+            if not values:
+                continue
+            name = values[1]  # Name column
+            selected = (values[0] == "☑")
+            switches = values[3]  # Switches column
+            if selected or switches:  # save if selected or custom switches
+                activators_state[name] = {
+                    'selected': selected,
+                    'switches': switches
+                }
+        print(f"Activators state: {activators_state}")
+
+        # External scripts (full list)
+        ext_scripts = self.external_scripts[:]
+        print(f"External scripts count: {len(ext_scripts)}")
+
+        # Backup: restore_selected_only and checked user sources
+        restore_selected_only = self.restore_selected_only_var.get()
+        checked_sources = []
+        for src_path, info in self.backup_tree_items.items():
+            if info['special']:
+                continue
+            item = info['item']
+            values = self.tree_backup.item(item, 'values')
+            if values and values[0] == "☑":
+                checked_sources.append(src_path)
+        print(f"Backup: restore_selected_only={restore_selected_only}, checked_sources={checked_sources}")
+
+        return {
+            'operations_order': ops,
+            'apps': apps_state,
+            'tweaks': tweaks_state,
+            'activators': activators_state,
+            'external_scripts': ext_scripts,
+            'backup': {
+                'restore_selected_only': restore_selected_only,
+                'checked_sources': checked_sources
+            }
+        }
+
+
+    def _apply_profile_data(self, data):
+        """
+        Apply profile data to the current GUI state and refresh.
+        Returns a dict of missing items per category.
+        """
+        print("\n--- Loading Profile ---")
+        missing = {
+            'Apps': [],
+            'Tweaks': [],
+            'Activators': [],
+            'Backup Sources': []
+        }
+
+        # 1. Operations order
+        new_ops = data.get('operations_order', [])
+        valid_internal = {op['internal'] for op in self.available_ops}
+        self.selected_operations = [op for op in new_ops if op in valid_internal]
+        self._refresh_selected_list()
+        print(f"Operations applied: {self.selected_operations}")
+
+        # 2. Apps (without reloading catalog)
+        apps_state = data.get('apps', {})
+        print(f"Apps from profile: {apps_state}")
+        for app in self.catalog.apps:
+            provider = apps_state.get(app.display_name)
+            if provider is not None:
+                # Check availability
+                if provider == 'offline' and (not app.is_offline_available or not app.offline_path):
+                    missing['Apps'].append(f"{app.display_name} (offline not available)")
+                    print(f"  [MISSING] {app.display_name}: offline unavailable")
+                    continue
+                elif provider == 'winget' and not app.winget_id:
+                    missing['Apps'].append(f"{app.display_name} (winget ID missing)")
+                    print(f"  [MISSING] {app.display_name}: winget ID missing")
+                    continue
+                elif provider == 'choco' and not app.choco_id:
+                    missing['Apps'].append(f"{app.display_name} (choco ID missing)")
+                    print(f"  [MISSING] {app.display_name}: choco ID missing")
+                    continue
+                app.selected_provider = provider
+                print(f"  [OK] {app.display_name} -> {provider}")
+            else:
+                app.selected_provider = None
+        self._refresh_install_tab(reload_catalog=False)   # keep catalog changes
+
+        # 3. Tweaks
+        tweaks_state = data.get('tweaks', {})
+        print(f"Tweaks from profile: {tweaks_state}")
+        tweaks_list = self.config.tweaks.get('tweaks', [])
+        tweak_name_to_index = {t['name']: i for i, t in enumerate(tweaks_list)}
+        for tweak_name, action in tweaks_state.items():
+            if tweak_name in tweak_name_to_index:
+                tweaks_list[tweak_name_to_index[tweak_name]]['selected_action'] = action
+                print(f"  [OK] {tweak_name} -> {action}")
+            else:
+                missing['Tweaks'].append(tweak_name)
+                print(f"  [MISSING] {tweak_name}")
+        self.config.tweaks['tweaks'] = tweaks_list
+        self.config.save_tweaks()
+        self._refresh_tweaks_tab()   # reloads from disk, good
+
+        # 4. Activators (modify treeview directly, do NOT refresh the whole tab)
+        activators_state = data.get('activators', {})
+        print(f"Activators from profile: {activators_state}")
+        activators = self.config.activators.get('activators', [])
+        activator_names = {a['name'] for a in activators}
+        for item in self.tree_activators.get_children():
+            values = self.tree_activators.item(item, 'values')
+            if not values:
+                continue
+            name = values[1]
+            if name in activators_state:
+                state = activators_state[name]
+                check = "☑" if state['selected'] else "☐"
+                switches = state['switches']
+                self.tree_activators.item(item, values=(check, name, values[2], switches, values[4]))
+                print(f"  [OK] {name}: selected={state['selected']}, switches='{switches}'")
+            else:
+                # Uncheck if not in profile
+                self.tree_activators.item(item, values=("☐", *values[1:]))
+        # Note missing activators
+        for act_name in activators_state.keys():
+            if act_name not in activator_names:
+                missing['Activators'].append(act_name)
+                print(f"  [MISSING] Activator '{act_name}' not found in current config")
+
+        # 5. External scripts
+        ext_scripts = data.get('external_scripts', [])
+        self.external_scripts = ext_scripts
+        self._refresh_external_tab()
+        print(f"External scripts loaded: {len(ext_scripts)}")
+
+        # 6. Backup settings (modify treeview directly, do NOT refresh sources list)
+        backup_data = data.get('backup', {})
+        print(f"Backup data from profile: {backup_data}")
+        if backup_data:
+            if 'restore_selected_only' in backup_data:
+                self.restore_selected_only_var.set(backup_data['restore_selected_only'])
+                print(f"  restore_selected_only set to {backup_data['restore_selected_only']}")
+            checked_sources = backup_data.get('checked_sources', [])
+            print(f"  checked_sources from profile: {checked_sources}")
+            # Mark each user source in tree
+            for src_path, info in self.backup_tree_items.items():
+                if info['special']:
+                    continue
+                item = info['item']
+                should_check = src_path in checked_sources
+                check = "☑" if should_check else "☐"
+                source_text = self.tree_backup.item(item, 'values')[1]
+                self.tree_backup.item(item, values=(check, source_text))
+                print(f"  {'[OK]' if should_check else '[UNCHECK]'} {src_path}")
+            # Find missing sources
+            current_source_set = set(self.backup_engine.sources)
+            for src in checked_sources:
+                if src not in current_source_set:
+                    missing['Backup Sources'].append(src)
+                    print(f"  [MISSING] Backup source '{src}' not in current sources list")
+
+        # Do NOT refresh these tabs again, because we've already applied states.
+        # (We already refreshed tweaks and external, and Apps with reload_catalog=False)
+        # We might want to refresh the activators tab? No, we modified treeview directly.
+        # We might want to ensure the Activator tab filter dropdown reflects any new categories? That's optional.
+
+        print(f"\nMissing items summary: {missing}")
+        return missing

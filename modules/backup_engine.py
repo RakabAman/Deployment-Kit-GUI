@@ -9,6 +9,8 @@ import datetime
 import logging
 import subprocess
 import sys
+import json
+import tempfile
 
 # For 7z support, we try to import py7zr (optional dependency)
 try:
@@ -94,9 +96,10 @@ class BackupEngine:
             return self.selected_backup_path
         return self.get_latest_backup()
 
-    def _create_archive(self, zip_path, source_folders, progress_callback=None):
+    def _create_archive(self, zip_path, source_folders, progress_callback=None, mapping=None):
         """
         Create an archive (zip or 7z) from a list of source folders.
+        If mapping is provided, it should be a list of dicts with keys 'folder' and 'original'.
         Returns (success, message).
         """
         try:
@@ -114,6 +117,17 @@ class BackupEngine:
                                 archive.write(file_path, arcname)
                         if progress_callback:
                             progress_callback((idx + 1) / total_folders * 100)
+
+                    # Add mapping.json if provided
+                    if mapping:
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                            json.dump({"sources": mapping}, tmp, indent=2)
+                            tmp_path = tmp.name
+                        try:
+                            archive.write(tmp_path, 'mapping.json')
+                        finally:
+                            os.unlink(tmp_path)
+
                 return True, "7z archive created"
             else:
                 # Use standard zip
@@ -128,6 +142,11 @@ class BackupEngine:
                                 zipf.write(file_path, arcname)
                         if progress_callback:
                             progress_callback((idx + 1) / total_folders * 100)
+
+                    # Add mapping.json if provided
+                    if mapping:
+                        zipf.writestr('mapping.json', json.dumps({"sources": mapping}, indent=2))
+
                 return True, "Zip archive created"
         except Exception as e:
             return False, str(e)
@@ -156,10 +175,15 @@ class BackupEngine:
         sources_to_backup = source_list if source_list is not None else self.sources
 
         expanded_sources = []
+        mapping = []   # list of {folder, original}
         for src in sources_to_backup:
             expanded = self.config.expand_path(src)
             if os.path.exists(expanded):
                 expanded_sources.append(expanded)
+                mapping.append({
+                    "folder": os.path.basename(expanded),
+                    "original": src   # store the original path (may contain env vars)
+                })
             else:
                 logger = logging.getLogger('DeploymentKit')
                 logger.warning(f"Source folder not found: {expanded}")
@@ -167,7 +191,7 @@ class BackupEngine:
         if not expanded_sources:
             return False, "No valid source folders found"
 
-        success, msg = self._create_archive(archive_path, expanded_sources, progress_callback)
+        success, msg = self._create_archive(archive_path, expanded_sources, progress_callback, mapping)
         if success:
             # Only set as selected if it's in the root (not a subfolder)
             if not subfolder:
@@ -223,7 +247,7 @@ class BackupEngine:
 
     def restore_backup(self, zip_path, progress_callback=None, sources_to_restore=None):
         """Restore a backup archive to the original source locations.
-           If sources_to_restore is provided, only restore those sources.
+           If sources_to_restore is provided, only restore those sources (list of source paths as stored).
         """
         logger = logging.getLogger('DeploymentKit')
         logger.debug(f"restore_backup called with: {zip_path}")
@@ -235,6 +259,7 @@ class BackupEngine:
         import tempfile
         temp_dir = tempfile.mkdtemp()
         try:
+            # Extract the archive
             if zip_path.endswith('.7z') and HAS_7Z:
                 with py7zr.SevenZipFile(zip_path, 'r') as archive:
                     archive.extractall(temp_dir)
@@ -242,33 +267,94 @@ class BackupEngine:
                 with zipfile.ZipFile(zip_path, 'r') as zipf:
                     zipf.extractall(temp_dir)
 
-            top_folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
+            # Check for mapping.json
+            mapping_file = os.path.join(temp_dir, 'mapping.json')
+            if os.path.isfile(mapping_file):
+                with open(mapping_file, 'r', encoding='utf-8') as f:
+                    mapping_data = json.load(f)
+                mapping = mapping_data.get('sources', [])
+                # Build a dict: folder -> original_path (as stored)
+                folder_to_original = {item['folder']: item['original'] for item in mapping}
 
-            # Determine which sources to restore
-            source_list = sources_to_restore if sources_to_restore is not None else self.sources
+                # Expand sources_to_restore if provided
+                restore_set = None
+                if sources_to_restore is not None:
+                    # Expand each path in sources_to_restore (they may contain env vars)
+                    restore_set = set()
+                    for src in sources_to_restore:
+                        expanded = self.config.expand_path(src)
+                        # Normalize case for Windows
+                        expanded = os.path.normpath(expanded)
+                        restore_set.add(expanded.lower())
 
-            for folder in top_folders:
-                matched_source = None
-                for src in source_list:
-                    expanded = self.config.expand_path(src)
-                    if os.path.basename(expanded) == folder:
-                        matched_source = expanded
-                        break
-                if matched_source is None:
-                    logger.warning(f"No matching source for folder '{folder}', skipping")
-                    continue
+                # Get top-level folders from extraction
+                top_folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
 
-                src_path = os.path.join(temp_dir, folder)
-                for root, dirs, files in os.walk(src_path):
-                    for file in files:
-                        src_file = os.path.join(root, file)
-                        rel_path = os.path.relpath(src_file, src_path)
-                        dest_file = os.path.join(matched_source, rel_path)
-                        os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-                        shutil.copy2(src_file, dest_file)
-                logger.debug(f"Restored folder '{folder}' to {matched_source}")
+                for folder in top_folders:
+                    if folder == 'mapping.json':  # skip the mapping file itself (it's not a folder)
+                        continue
+                    # Look up original path
+                    original_path = folder_to_original.get(folder)
+                    if not original_path:
+                        logger.warning(f"Folder '{folder}' not found in mapping, skipping")
+                        continue
+                    # Expand original path
+                    target_path = self.config.expand_path(original_path)
+                    target_path = os.path.normpath(target_path)
 
-            return True, "Restore completed successfully"
+                    # If restore_set is not None, check if this target is in the set
+                    if restore_set is not None:
+                        if target_path.lower() not in restore_set:
+                            logger.debug(f"Skipping '{folder}' (not in restore selection)")
+                            continue
+
+                    # Ensure target directory exists
+                    os.makedirs(target_path, exist_ok=True)
+
+                    # Copy files from temp_dir/folder to target_path
+                    src_folder = os.path.join(temp_dir, folder)
+                    for root, dirs, files in os.walk(src_folder):
+                        for file in files:
+                            src_file = os.path.join(root, file)
+                            rel_path = os.path.relpath(src_file, src_folder)
+                            dest_file = os.path.join(target_path, rel_path)
+                            os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+                            shutil.copy2(src_file, dest_file)
+                    logger.debug(f"Restored folder '{folder}' to {target_path}")
+
+                return True, "Restore completed successfully (mapping-based)"
+
+            else:
+                # Fallback: legacy backup without mapping - use basename matching
+                logger.info("No mapping.json found, using legacy basename matching")
+                top_folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
+
+                # Determine which sources to restore
+                source_list = sources_to_restore if sources_to_restore is not None else self.sources
+
+                for folder in top_folders:
+                    matched_source = None
+                    for src in source_list:
+                        expanded = self.config.expand_path(src)
+                        if os.path.basename(expanded) == folder:
+                            matched_source = expanded
+                            break
+                    if matched_source is None:
+                        logger.warning(f"No matching source for folder '{folder}', skipping")
+                        continue
+
+                    src_path = os.path.join(temp_dir, folder)
+                    for root, dirs, files in os.walk(src_path):
+                        for file in files:
+                            src_file = os.path.join(root, file)
+                            rel_path = os.path.relpath(src_file, src_path)
+                            dest_file = os.path.join(matched_source, rel_path)
+                            os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+                            shutil.copy2(src_file, dest_file)
+                    logger.debug(f"Restored folder '{folder}' to {matched_source}")
+
+                return True, "Restore completed successfully (legacy)"
+
         except Exception as e:
             import traceback
             logger.error(f"Restore exception: {e}")
@@ -276,7 +362,6 @@ class BackupEngine:
             return False, str(e)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
-
 
     def add_source(self, source_path):
         """Add a source folder to the backup list, converting to env var if possible."""
