@@ -198,56 +198,18 @@ class BackupEngine:
                 self.set_selected_by_filename(archive_name)
         return success, archive_path if success else msg
 
-    def _extract_archive(self, archive_path, target_base_dir, progress_callback=None):
-        """Extract an archive (zip or 7z) to target_base_dir, preserving folder structure."""
-        try:
-            if archive_path.endswith('.7z') and HAS_7Z:
-                with py7zr.SevenZipFile(archive_path, 'r') as archive:
-                    import tempfile
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        archive.extractall(tmpdir)
-                        for root, dirs, files in os.walk(tmpdir):
-                            for file in files:
-                                src_file = os.path.join(root, file)
-                                rel_path = os.path.relpath(src_file, tmpdir)
-                                dest_file = os.path.join(target_base_dir, rel_path)
-                                os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-                                shutil.copy2(src_file, dest_file)
-                                if progress_callback:
-                                    progress_callback(50)
-                    return True, "Extracted successfully"
-            else:
-                with zipfile.ZipFile(archive_path, 'r') as zipf:
-                    top_dirs = set()
-                    for name in zipf.namelist():
-                        parts = name.split('/')
-                        if parts and parts[0]:
-                            top_dirs.add(parts[0])
-
-                    for top in top_dirs:
-                        matched_source = None
-                        for src in self.sources:
-                            expanded = self.config.expand_path(src)
-                            if os.path.basename(expanded) == top:
-                                matched_source = expanded
-                                break
-                        if matched_source is None:
-                            continue
-                        for name in zipf.namelist():
-                            if name.startswith(top + '/'):
-                                rel_path = os.path.relpath(name, top)
-                                dest_path = os.path.join(matched_source, rel_path)
-                                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                                with zipf.open(name) as src_file:
-                                    with open(dest_path, 'wb') as dst_file:
-                                        shutil.copyfileobj(src_file, dst_file)
-                return True, "Extracted successfully"
-        except Exception as e:
-            return False, str(e)
-
     def restore_backup(self, zip_path, progress_callback=None, sources_to_restore=None):
         """Restore a backup archive to the original source locations.
            If sources_to_restore is provided, only restore those sources (list of source paths as stored).
+
+        Extracts each selected source's files directly to their final
+        destination in one pass, instead of extracting the whole archive
+        to a temp folder and then copying every file a second time. Two
+        concrete benefits beyond speed: unselected sources are never
+        extracted anywhere (not even temporarily), and progress_callback
+        now reflects real per-source progress instead of not being called
+        at all (the previous implementation accepted the parameter but
+        never invoked it).
         """
         logger = logging.getLogger('DeploymentKit')
         logger.debug(f"restore_backup called with: {zip_path}")
@@ -256,83 +218,85 @@ class BackupEngine:
             logger.error(f"Archive file not found: {zip_path}")
             return False, f"Archive file not found: {zip_path}"
 
-        import tempfile
-        temp_dir = tempfile.mkdtemp()
+        is_7z = zip_path.endswith('.7z') and HAS_7Z
+
         try:
-            # Extract the archive
-            if zip_path.endswith('.7z') and HAS_7Z:
+            # --- Step 1: read mapping.json only (a few bytes), not the
+            # whole archive, so we know what's inside before deciding what
+            # to extract. ---
+            mapping_data = None
+            if is_7z:
                 with py7zr.SevenZipFile(zip_path, 'r') as archive:
-                    archive.extractall(temp_dir)
+                    all_names = archive.getnames()
+                    if 'mapping.json' in all_names:
+                        with tempfile.TemporaryDirectory() as tiny_tmp:
+                            archive.extract(path=tiny_tmp, targets=['mapping.json'])
+                            with open(os.path.join(tiny_tmp, 'mapping.json'), 'r', encoding='utf-8') as f:
+                                mapping_data = json.load(f)
+                    top_level_names = sorted({n.split('/')[0] for n in all_names if n and n != 'mapping.json'})
             else:
                 with zipfile.ZipFile(zip_path, 'r') as zipf:
-                    zipf.extractall(temp_dir)
+                    all_names = zipf.namelist()
+                    if 'mapping.json' in all_names:
+                        mapping_data = json.loads(zipf.read('mapping.json').decode('utf-8'))
+                    top_level_names = sorted({n.split('/')[0] for n in all_names if n and n != 'mapping.json'})
 
-            # Check for mapping.json
-            mapping_file = os.path.join(temp_dir, 'mapping.json')
-            if os.path.isfile(mapping_file):
-                with open(mapping_file, 'r', encoding='utf-8') as f:
-                    mapping_data = json.load(f)
+            if mapping_data is not None:
                 mapping = mapping_data.get('sources', [])
-                # Build a dict: folder -> original_path (as stored)
                 folder_to_original = {item['folder']: item['original'] for item in mapping}
 
-                # Expand sources_to_restore if provided
                 restore_set = None
                 if sources_to_restore is not None:
-                    # Expand each path in sources_to_restore (they may contain env vars)
                     restore_set = set()
                     for src in sources_to_restore:
-                        expanded = self.config.expand_path(src)
-                        # Normalize case for Windows
-                        expanded = os.path.normpath(expanded)
+                        expanded = os.path.normpath(self.config.expand_path(src))
                         restore_set.add(expanded.lower())
 
-                # Get top-level folders from extraction
-                top_folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
-
-                for folder in top_folders:
-                    if folder == 'mapping.json':  # skip the mapping file itself (it's not a folder)
-                        continue
-                    # Look up original path
+                # Decide the full list of (folder, target_path) to restore
+                # up front, so progress_callback can report real percentages.
+                plan = []
+                for folder in top_level_names:
                     original_path = folder_to_original.get(folder)
                     if not original_path:
                         logger.warning(f"Folder '{folder}' not found in mapping, skipping")
                         continue
-                    # Expand original path
-                    target_path = self.config.expand_path(original_path)
-                    target_path = os.path.normpath(target_path)
+                    target_path = os.path.normpath(self.config.expand_path(original_path))
+                    if restore_set is not None and target_path.lower() not in restore_set:
+                        logger.debug(f"Skipping '{folder}' (not in restore selection)")
+                        continue
+                    plan.append((folder, target_path))
 
-                    # If restore_set is not None, check if this target is in the set
-                    if restore_set is not None:
-                        if target_path.lower() not in restore_set:
-                            logger.debug(f"Skipping '{folder}' (not in restore selection)")
-                            continue
+                total = len(plan)
+                if total == 0:
+                    return True, "Nothing selected to restore"
 
-                    # Ensure target directory exists
+                for i, (folder, target_path) in enumerate(plan):
                     os.makedirs(target_path, exist_ok=True)
-
-                    # Copy files from temp_dir/folder to target_path
-                    src_folder = os.path.join(temp_dir, folder)
-                    for root, dirs, files in os.walk(src_folder):
-                        for file in files:
-                            src_file = os.path.join(root, file)
-                            rel_path = os.path.relpath(src_file, src_folder)
-                            dest_file = os.path.join(target_path, rel_path)
-                            os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-                            shutil.copy2(src_file, dest_file)
+                    dest_parent = os.path.dirname(target_path)
+                    if is_7z:
+                        with py7zr.SevenZipFile(zip_path, 'r') as archive:
+                            all_names = archive.getnames()
+                            targets = [n for n in all_names if n == folder or n.startswith(folder + '/')]
+                            archive.extract(path=dest_parent, targets=targets)
+                    else:
+                        with zipfile.ZipFile(zip_path, 'r') as zipf:
+                            members = [n for n in zipf.namelist()
+                                       if n == folder or n == folder + '/' or n.startswith(folder + '/')]
+                            zipf.extractall(path=dest_parent, members=members)
                     logger.debug(f"Restored folder '{folder}' to {target_path}")
+                    if progress_callback:
+                        progress_callback(int(((i + 1) / total) * 100))
 
-                return True, "Restore completed successfully (mapping-based)"
+                return True, f"Restore completed successfully ({total} item(s) restored)"
 
             else:
-                # Fallback: legacy backup without mapping - use basename matching
+                # Legacy backup without mapping.json - match by basename.
+                # Selective/direct-to-destination extraction still applies.
                 logger.info("No mapping.json found, using legacy basename matching")
-                top_folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
-
-                # Determine which sources to restore
                 source_list = sources_to_restore if sources_to_restore is not None else self.sources
 
-                for folder in top_folders:
+                plan = []
+                for folder in top_level_names:
                     matched_source = None
                     for src in source_list:
                         expanded = self.config.expand_path(src)
@@ -342,26 +306,36 @@ class BackupEngine:
                     if matched_source is None:
                         logger.warning(f"No matching source for folder '{folder}', skipping")
                         continue
+                    plan.append((folder, os.path.normpath(matched_source)))
 
-                    src_path = os.path.join(temp_dir, folder)
-                    for root, dirs, files in os.walk(src_path):
-                        for file in files:
-                            src_file = os.path.join(root, file)
-                            rel_path = os.path.relpath(src_file, src_path)
-                            dest_file = os.path.join(matched_source, rel_path)
-                            os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-                            shutil.copy2(src_file, dest_file)
-                    logger.debug(f"Restored folder '{folder}' to {matched_source}")
+                total = len(plan)
+                if total == 0:
+                    return True, "Nothing to restore"
 
-                return True, "Restore completed successfully (legacy)"
+                for i, (folder, target_path) in enumerate(plan):
+                    os.makedirs(target_path, exist_ok=True)
+                    dest_parent = os.path.dirname(target_path)
+                    if is_7z:
+                        with py7zr.SevenZipFile(zip_path, 'r') as archive:
+                            all_names = archive.getnames()
+                            targets = [n for n in all_names if n == folder or n.startswith(folder + '/')]
+                            archive.extract(path=dest_parent, targets=targets)
+                    else:
+                        with zipfile.ZipFile(zip_path, 'r') as zipf:
+                            members = [n for n in zipf.namelist()
+                                       if n == folder or n == folder + '/' or n.startswith(folder + '/')]
+                            zipf.extractall(path=dest_parent, members=members)
+                    logger.debug(f"Restored folder '{folder}' to {target_path}")
+                    if progress_callback:
+                        progress_callback(int(((i + 1) / total) * 100))
+
+                return True, f"Restore completed successfully (legacy, {total} item(s) restored)"
 
         except Exception as e:
             import traceback
             logger.error(f"Restore exception: {e}")
             logger.error(traceback.format_exc())
             return False, str(e)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def add_source(self, source_path):
         """Add a source folder to the backup list, converting to env var if possible."""

@@ -9,10 +9,11 @@ import threading
 import time
 import shutil
 from modules.config_manager import ConfigManager
+from modules.version_cache import VersionCache, DEFAULT_STALE_AFTER_SECONDS
 
 class AppEntry:
     """Represents a single application entry."""
-    def __init__(self, data, config_manager):
+    def __init__(self, data, config_manager, version_cache=None):
         self.config = config_manager
         self.display_name = data.get('display_name', '')
         self.category = data.get('category', '')
@@ -27,11 +28,31 @@ class AppEntry:
         self.selected_provider = None
         self.is_offline_available = False
         self.post_install_script = data.get('post_install_script', '')
-        
-        # Cached versions
+        self.post_install_interactive = data.get('post_install_interactive', True)
+
+        # In-memory cached versions. These used to share one timestamp
+        # field between winget and choco, which meant looking up one
+        # could make the other appear fresher than it actually was.
+        # They're now tracked separately.
         self._winget_version = None
         self._choco_version = None
-        self._version_cache_time = 0
+        self._winget_cache_time = 0
+        self._choco_cache_time = 0
+
+        # Shared, disk-persisted cache across sessions/refreshes. AppEntry
+        # objects get rebuilt from scratch on every catalog.refresh(), so
+        # without this the in-memory cache above was being thrown away
+        # constantly and every reload re-scraped winget/choco from zero.
+        self._version_cache_store = version_cache
+        if version_cache:
+            cached = version_cache.get('winget', self.winget_id)
+            if cached:
+                self._winget_version = cached['version']
+                self._winget_cache_time = cached['timestamp']
+            cached = version_cache.get('choco', self.choco_id)
+            if cached:
+                self._choco_version = cached['version']
+                self._choco_cache_time = cached['timestamp']
 
     def to_dict(self):
         return {
@@ -48,15 +69,20 @@ class AppEntry:
             'post_install_script': self.post_install_script,
         }
 
-    def get_winget_version(self):
+    def _cache_winget_result(self, version):
+        self._winget_version = version
+        self._winget_cache_time = time.time()
+        if self._version_cache_store:
+            self._version_cache_store.set('winget', self.winget_id, version)
+        return version
+
+    def get_winget_version(self, force=False):
         if not self.winget_id:
             return ""
-        if self._winget_version and (time.time() - self._version_cache_time) < 300:
+        if not force and self._winget_version and (time.time() - self._winget_cache_time) < 300:
             return self._winget_version
         if not shutil.which('winget'):
-            self._winget_version = "Winget not found"
-            self._version_cache_time = time.time()
-            return self._winget_version
+            return self._cache_winget_result("Winget not found")
 
         def extract_version_from_show(stdout):
             for line in stdout.split('\n'):
@@ -82,9 +108,7 @@ class AppEntry:
             if result.returncode == 0:
                 version = extract_version_from_show(result.stdout)
                 if version:
-                    self._winget_version = version
-                    self._version_cache_time = time.time()
-                    return version
+                    return self._cache_winget_result(version)
         except (subprocess.TimeoutExpired, Exception):
             pass
 
@@ -108,25 +132,26 @@ class AppEntry:
                         if len(parts) >= 3:
                             version = parts[2].strip()
                             if version:
-                                self._winget_version = version
-                                self._version_cache_time = time.time()
-                                return version
+                                return self._cache_winget_result(version)
         except Exception:
             pass
 
-        self._winget_version = "Not found"
-        self._version_cache_time = time.time()
-        return self._winget_version
+        return self._cache_winget_result("Not found")
 
-    def get_choco_version(self):
+    def _cache_choco_result(self, version):
+        self._choco_version = version
+        self._choco_cache_time = time.time()
+        if self._version_cache_store:
+            self._version_cache_store.set('choco', self.choco_id, version)
+        return version
+
+    def get_choco_version(self, force=False):
         if not self.choco_id:
             return ""
-        if self._choco_version and (time.time() - self._version_cache_time) < 300:
+        if not force and self._choco_version and (time.time() - self._choco_cache_time) < 300:
             return self._choco_version
         if not shutil.which('choco'):
-            self._choco_version = "Choco not installed"
-            self._version_cache_time = time.time()
-            return self._choco_version
+            return self._cache_choco_result("Choco not installed")
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -147,12 +172,8 @@ class AppEntry:
                             parts = line.split('|')
                             if len(parts) >= 2:
                                 version = parts[1].strip()
-                                self._choco_version = version
-                                self._version_cache_time = time.time()
-                                return version
-                    self._choco_version = "No version found"
-                    self._version_cache_time = time.time()
-                    return self._choco_version
+                                return self._cache_choco_result(version)
+                    return self._cache_choco_result("No version found")
                 else:
                     error_msg = result.stderr.strip() or result.stdout.strip()
                     # Check if the error suggests a network/retry issue
@@ -163,39 +184,29 @@ class AppEntry:
                             continue
                         else:
                             # Last attempt failed; treat as not found
-                            self._choco_version = "Not found"
-                            self._version_cache_time = time.time()
-                            return self._choco_version
+                            return self._cache_choco_result("Not found")
                     else:
                         # Other error
                         if "not found" in error_msg.lower() or "no such" in error_msg.lower():
-                            self._choco_version = "Not found"
+                            return self._cache_choco_result("Not found")
                         else:
-                            self._choco_version = f"Error: {error_msg[:30]}" if error_msg else f"Error ({result.returncode})"
-                        self._version_cache_time = time.time()
-                        return self._choco_version
+                            return self._cache_choco_result(
+                                f"Error: {error_msg[:30]}" if error_msg else f"Error ({result.returncode})"
+                            )
             except subprocess.TimeoutExpired:
                 # Timeout: treat as network issue, retry if not last attempt
                 if attempt < max_retries - 1:
                     time.sleep(0.5)
                     continue
                 else:
-                    self._choco_version = "Timeout"
-                    self._version_cache_time = time.time()
-                    return self._choco_version
+                    return self._cache_choco_result("Timeout")
             except FileNotFoundError:
-                self._choco_version = "Choco not installed"
-                self._version_cache_time = time.time()
-                return self._choco_version
+                return self._cache_choco_result("Choco not installed")
             except Exception as e:
-                self._choco_version = f"Error: {str(e)[:30]}"
-                self._version_cache_time = time.time()
-                return self._choco_version
+                return self._cache_choco_result(f"Error: {str(e)[:30]}")
 
         # Fallback (should not reach here)
-        self._choco_version = "Not found"
-        self._version_cache_time = time.time()
-        return self._choco_version
+        return self._cache_choco_result("Not found")
 
     def get_display_version(self, provider):
         if provider == 'offline':
@@ -209,7 +220,13 @@ class AppEntry:
     def clear_version_cache(self):
         self._winget_version = None
         self._choco_version = None
-        self._version_cache_time = 0
+        self._winget_cache_time = 0
+        self._choco_cache_time = 0
+        # Note: this only clears the in-memory value for this instance.
+        # It intentionally does not scrub the persistent version_cache
+        # entry - the next real fetch will overwrite it anyway, and
+        # AppEntry instances get rebuilt (and re-seeded from the
+        # persistent cache) on every catalog.refresh().
 
 
 class AppCatalog:
@@ -217,12 +234,17 @@ class AppCatalog:
         self.config = config_manager
         self.apps = []
         self._fetching_versions = False
+        # Shared across every AppEntry and across catalog.refresh() calls,
+        # and persisted to disk - this is what lets version info survive
+        # both a tab reload and an app restart instead of resetting to
+        # blank every time AppEntry objects get rebuilt below.
+        self.version_cache = VersionCache(self.config.base_dir)
 
     def refresh(self):
         self.apps = []
         data = self.config.apps.get('apps', [])
         for entry_data in data:
-            app = AppEntry(entry_data, self.config)
+            app = AppEntry(entry_data, self.config, version_cache=self.version_cache)
             if app.offline_path:
                 full_path = os.path.join(self.config.base_dir, app.offline_path)
                 if os.path.isfile(full_path):
@@ -289,15 +311,22 @@ class AppCatalog:
                     commands.append({
                         'display_name': app.display_name,
                         'command': cmd,
+                        'id': app.winget_id,
                         'is_silent': True
                     })
-        elif operation == 'chocolatey':
+        elif operation == 'choco':
+            # NOTE: this used to check operation == 'chocolatey', but every
+            # caller passes 'choco' - the two never matched, so this
+            # branch never ran and choco installs silently reported
+            # "success, no apps to install" even when choco apps were
+            # selected. Fixed to match what's actually passed in.
             for app in self.apps:
                 if app.selected_provider == 'choco' and app.choco_id:
                     cmd = self.config.get_command('choco_install', package=app.choco_id)
                     commands.append({
                         'display_name': app.display_name,
                         'command': cmd,
+                        'id': app.choco_id,
                         'is_silent': True
                     })
         elif operation == 'drivers':
@@ -345,7 +374,7 @@ class AppCatalog:
         return False
 
     def add_app(self, app_data):
-        new_app = AppEntry(app_data, self.config)
+        new_app = AppEntry(app_data, self.config, version_cache=self.version_cache)
         self.apps.append(new_app)
         self._save_apps_to_config()
         return new_app

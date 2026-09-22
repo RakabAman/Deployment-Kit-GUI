@@ -7,8 +7,14 @@ from tkinter import ttk, messagebox, scrolledtext
 import threading
 import os
 import datetime
+import time
+import webbrowser
+import logging
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from modules.config_manager import ConfigManager
 from modules.app_catalog import AppCatalog
+from modules.report_builder import build_deployment_report
 from modules.backup_engine import BackupEngine
 from modules.install_engine import InstallEngine
 from modules.settings_dialog import SettingsDialog
@@ -18,6 +24,7 @@ class DeploymentGUI:
     def __init__(self, root, is_admin):
         self.root = root
         self.is_admin = is_admin
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.config = ConfigManager()
         self.catalog = AppCatalog(self.config)
@@ -77,7 +84,11 @@ class DeploymentGUI:
                                   self._apply_profile_data,
                                   self.log_text_insert
                               ))
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        if not self.is_admin:
+            file_menu.add_separator()
+            file_menu.add_command(label="Relaunch as Administrator...", command=self._relaunch_as_admin)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._on_close)
         menubar.add_cascade(label="File", menu=file_menu)
 
 
@@ -302,6 +313,8 @@ class DeploymentGUI:
         filter_combo.bind('<<ComboboxSelected>>', lambda e: self._refresh_install_tab())
 
         ttk.Button(filter_frame, text="Check Version", command=self._refresh_versions).pack(side=tk.RIGHT, padx=5)
+        self.version_check_status_var = tk.StringVar(value="")
+        ttk.Label(filter_frame, textvariable=self.version_check_status_var, foreground='#555').pack(side=tk.RIGHT, padx=8)
 
         self.install_container = ttk.Frame(self.install_frame)
         self.install_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -373,14 +386,30 @@ class DeploymentGUI:
             ))
             self.app_tree_items[app.display_name] = item
 
-        # Show cached versions if any
+        # Show cached versions immediately - no waiting on a network call
+        # to see something on screen.
         self._display_cached_versions()
+
+        # Quietly refresh anything that's gone stale in the background.
+        # This is staleness-gated and pool-capped (see
+        # _fetch_versions_background), so reloading this tab repeatedly
+        # doesn't re-trigger a full re-scrape every time.
+        self._fetch_versions_background(force=False)
         
         
-    def _fetch_versions_background(self):
-        """Fetch versions in parallel, updating labels as they arrive."""
-        import threading
-        import time
+    def _fetch_versions_background(self, force=False):
+        """Refresh versions using a capped worker pool instead of one raw
+        thread per (app, provider) pair - with a full catalog that could
+        mean 100+ threads all shelling out to winget/choco simultaneously,
+        which is what was causing the long, unresponsive "refresh" before.
+
+        force=False (the normal, automatic path - e.g. on tab load): skips
+        any entry that's already cached and not yet stale, so a routine
+        reload doesn't re-hit the network for everything that was checked
+        a few minutes ago.
+        force=True (the explicit "Check Version" button): re-checks
+        everything regardless of how fresh the cache is.
+        """
 
         def version_callback(display_name, provider, version):
             try:
@@ -393,44 +422,60 @@ class DeploymentGUI:
         def fetch_one(app, provider):
             try:
                 if provider == 'winget':
-                    if not app.winget_id:
-                        return
-                    if app._winget_version and (time.time() - app._version_cache_time) < 300:
-                        version = app._winget_version
-                    else:
-                        version = app.get_winget_version()
-                    print(f"DEBUG winget: {app.display_name} -> {version}")
+                    version = app.get_winget_version(force=force)
                     version_callback(app.display_name, 'winget', version)
                 elif provider == 'choco':
-                    if not app.choco_id:
-                        return
-                    if app._choco_version and (time.time() - app._version_cache_time) < 300:
-                        version = app._choco_version
-                    else:
-                        version = app.get_choco_version()
-                    print(f"DEBUG choco: {app.display_name} -> {version}")
+                    version = app.get_choco_version(force=force)
                     version_callback(app.display_name, 'choco', version)
             except Exception as e:
-                print(f"DEBUG EXCEPTION: {app.display_name} {provider}: {e}")
                 version_callback(app.display_name, provider, f"Error: {str(e)[:15]}")
 
-        # Display cached versions first
+        # Show whatever's already cached (from disk or memory) immediately -
+        # no need to wait on any network call to see something on screen.
         self.root.after_idle(self._display_cached_versions)
 
         tasks = []
         for app in self.catalog.apps:
-            if app.winget_id:
+            if app.winget_id and (force or self.catalog.version_cache.is_stale('winget', app.winget_id)):
                 tasks.append((app, 'winget'))
-            if app.choco_id:
+            if app.choco_id and (force or self.catalog.version_cache.is_stale('choco', app.choco_id)):
                 tasks.append((app, 'choco'))
 
         if not tasks:
             return
 
+        total = len(tasks)
+        progress_lock = threading.Lock()
+        progress = {'done': 0}
+
+        def _set_status(text):
+            try:
+                self.version_check_status_var.set(text)
+            except (RuntimeError, tk.TclError):
+                pass
+
+        self.root.after_idle(lambda: _set_status(f"Checking versions… (0/{total})"))
+
+        def fetch_and_track(app, provider):
+            fetch_one(app, provider)
+            with progress_lock:
+                progress['done'] += 1
+                done, remaining_total = progress['done'], total
+            if done >= remaining_total:
+                self.root.after_idle(lambda: _set_status(""))
+                # Persist whatever was freshly fetched this batch so the
+                # next launch/tab-reload sees it immediately too.
+                self.root.after_idle(self.catalog.version_cache.save)
+            else:
+                self.root.after_idle(lambda: _set_status(f"Checking versions… ({done}/{remaining_total})"))
+
+        # Capped pool: a handful of winget/choco processes at a time
+        # instead of every task firing off its own thread at once.
+        executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="version-check")
         for app, provider in tasks:
-            thread = threading.Thread(target=fetch_one, args=(app, provider), daemon=True)
-            thread.start()
-            
+            executor.submit(fetch_and_track, app, provider)
+        executor.shutdown(wait=False)
+
     def _display_cached_versions(self):
         """Display already‑cached versions immediately (if any)."""
         for app in self.catalog.apps:
@@ -445,7 +490,8 @@ class DeploymentGUI:
             self._refresh_app_row(app)
             
     def _refresh_versions(self):
-        self._fetch_versions_background()
+        # Manual "Check Version" click always bypasses the staleness gate.
+        self._fetch_versions_background(force=True)
 
     def _build_cell_text(self, app, provider):
         """Build the display text for a provider column (checkbox + version)."""
@@ -967,6 +1013,9 @@ class DeploymentGUI:
             messagebox.showwarning("No Operations", "Please add operations to the execution order.")
             return
 
+        if not self._show_predeploy_confirmation():
+            return
+
         selected_activators = []
         for item in self.tree_activators.get_children():
             values = self.tree_activators.item(item, 'values')
@@ -1006,14 +1055,383 @@ class DeploymentGUI:
         self.install_engine.start_deployment(on_finished=self._deployment_finished)
         self._update_status_panel()
         
+    def _show_predeploy_confirmation(self):
+        """Show everything queued for this deployment before Deploy actually
+        fires, with callouts on anything irreversible or elevation-sensitive.
+        Returns True if the user confirms, False if they cancel."""
+        op_display = {op['internal']: op.get('display', op['internal']) for op in self.available_ops}
+        ops = self.selected_operations[:]
+        # Lowercased display text of every operation actually in the Execution
+        # Order, so each summary section below only shows items that will
+        # really run - not everything that happens to be checked in its tab.
+        sel = {op_display.get(internal, internal).strip().lower() for internal in ops}
+
+        def op_queued(*exact_texts):
+            return any(t in sel for t in exact_texts)
+
+        apps = []
+        for a in self.catalog.apps:
+            if not a.selected_provider:
+                continue
+            provider = a.selected_provider
+            if provider == 'winget':
+                if not op_queued('install winget apps'):
+                    continue
+            elif provider == 'choco':
+                if not op_queued('install chocolatey apps'):
+                    continue
+            elif provider == 'offline':
+                itype = (getattr(a, 'install_type', '') or '').lower()
+                if itype == 'silent':
+                    if not op_queued('install silent apps'):
+                        continue
+                elif itype in ('non-silent', 'nonsilent', 'non silent'):
+                    if not op_queued('install non-silent apps'):
+                        continue
+                elif itype == 'driver':
+                    if not op_queued('install drivers'):
+                        continue
+                else:
+                    # Unrecognized offline type (e.g. script/redist) - be
+                    # conservative and only hide it if none of the offline
+                    # install operations are queued at all.
+                    if not op_queued('install silent apps', 'install non-silent apps', 'install drivers'):
+                        continue
+            apps.append((a.display_name, provider))
+
+        tweaks = []
+        if op_queued('apply tweaks'):
+            tweaks = [
+                (t.get('name', ''), t.get('selected_action'), t.get('category', ''))
+                for t in self.config.tweaks.get('tweaks', [])
+                if t.get('selected_action')
+            ]
+
+        activators = []
+        if op_queued('run activators'):
+            for item in self.tree_activators.get_children():
+                values = self.tree_activators.item(item, 'values')
+                if values and values[0] == "☑":
+                    activators.append((values[1], values[3]))
+
+        ext_scripts = []
+        if op_queued('run external scripts'):
+            ext_scripts = self.get_checked_external_scripts()
+
+        is_restore = op_queued('restore backup')
+        backup_info = None
+        if is_restore:
+            backup_file = self.backup_combo.get() if hasattr(self, 'backup_combo') else ''
+            if self.restore_selected_only_var.get():
+                checked = []
+                for src_path, info in self.backup_tree_items.items():
+                    if info['special']:
+                        continue
+                    values = self.tree_backup.item(info['item'], 'values')
+                    if values and values[0] == "☑":
+                        checked.append(src_path)
+                backup_info = (backup_file, checked)
+            else:
+                backup_info = (backup_file, None)  # None = full restore, everything
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Confirm Deployment")
+        dialog.geometry("650x560")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        result = {'confirmed': False}
+
+        ttk.Label(dialog, text="Review everything queued below before deploying.",
+                  font=('Arial', 10, 'bold')).pack(anchor='w', padx=10, pady=(10, 5))
+
+        text_frame = ttk.Frame(dialog)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        text = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, height=22)
+        text.pack(fill=tk.BOTH, expand=True)
+        text.tag_config('section', font=('Arial', 10, 'bold'))
+        text.tag_config('warn', foreground='#b30000')
+
+        text.insert(tk.END, "Execution order:\n", ('section',))
+        if ops:
+            for i, internal in enumerate(ops, 1):
+                text.insert(tk.END, f"    {i}. {op_display.get(internal, internal)}\n")
+        else:
+            text.insert(tk.END, "    (none)\n")
+        text.insert(tk.END, "\n")
+
+        if apps:
+            text.insert(tk.END, f"Apps to install ({len(apps)}):\n", ('section',))
+            for name, provider in apps:
+                text.insert(tk.END, f"    \u2022 {name} \u2014 via {provider}\n")
+            text.insert(tk.END, "\n")
+
+        if tweaks:
+            text.insert(tk.END, f"Tweaks to apply ({len(tweaks)}):\n", ('section',))
+            for name, action, category in tweaks:
+                suffix = f" ({category})" if category else ""
+                text.insert(tk.END, f"    \u2022 {name} \u2014 {action}{suffix}\n")
+            text.insert(tk.END, "\n")
+
+        if activators:
+            text.insert(tk.END, "\u26a0 Activators to run \u2014 modifies system licensing state:\n",
+                        ('section', 'warn'))
+            for name, switches in activators:
+                line = f"    \u2022 {name}"
+                if switches:
+                    line += f" (switches: {switches})"
+                text.insert(tk.END, line + "\n", ('warn',))
+            text.insert(tk.END, "\n")
+
+        if ext_scripts:
+            text.insert(
+                tk.END,
+                f"\u26a0 External scripts to run ({len(ext_scripts)}) \u2014 arbitrary code, review before deploying:\n",
+                ('section', 'warn')
+            )
+            for s in ext_scripts:
+                text.insert(tk.END, f"    \u2022 {s.get('name', '(unnamed)')} [{s.get('type', '')}]\n", ('warn',))
+            text.insert(tk.END, "\n")
+
+        if backup_info is not None:
+            backup_file, checked = backup_info
+            text.insert(tk.END, "\u26a0 Restore \u2014 overwrites existing files at the restored paths:\n",
+                        ('section', 'warn'))
+            text.insert(tk.END, f"    \u2022 Backup: {backup_file or '(none selected)'}\n", ('warn',))
+            if checked is None:
+                text.insert(tk.END, "    \u2022 Scope: full restore (all sources)\n", ('warn',))
+            elif checked:
+                text.insert(tk.END, f"    \u2022 Scope: {len(checked)} selected source(s)\n", ('warn',))
+                for src in checked:
+                    text.insert(tk.END, f"        - {src}\n", ('warn',))
+            else:
+                text.insert(tk.END, "    \u2022 Scope: none selected (only protected special sources)\n", ('warn',))
+            text.insert(tk.END, "\n")
+
+        if not self.is_admin and any(p == 'choco' for _, p in apps):
+            text.insert(
+                tk.END,
+                "\u26a0 Not running elevated \u2014 Chocolatey installs will likely fail without Administrator rights.\n",
+                ('warn',)
+            )
+            text.insert(tk.END, "\n")
+
+        if not any([apps, tweaks, activators, ext_scripts, backup_info]):
+            text.insert(tk.END, "Nothing is selected within these operations \u2014 running this will do "
+                                 "little or nothing. Consider selecting apps/tweaks/activators/scripts "
+                                 "first, or Cancel.\n", ('warn',))
+
+        text.config(state=tk.DISABLED)
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        def on_confirm():
+            result['confirmed'] = True
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Deploy", command=on_confirm).pack(side=tk.RIGHT, padx=5)
+
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        dialog.wait_window()
+        return result['confirmed']
+
     def _enable_ui(self):
         self.btn_deploy.config(state=tk.NORMAL)
         self.btn_cancel.config(state=tk.DISABLED)
 
+    def _relaunch_as_admin(self):
+        """Relaunches the app elevated via the standard UAC 'runas' verb.
+        Opt-in rather than a forced startup prompt, since real testing
+        showed no single right answer here: Chocolatey genuinely needs
+        elevation (it fails writing to ProgramData without it), but
+        winget actually worked *worse* elevated in testing - an
+        installer's own UAC prompt got silently auto-cancelled specific
+        to a nested "already elevated" relaunch, and worked cleanly
+        non-elevated instead. So this is offered, not forced."""
+        proceed = messagebox.askyesno(
+            "Relaunch as Administrator",
+            "Chocolatey installs typically need this (they fail writing to system folders "
+            "without it).\n\n"
+            "Note: testing has shown winget can sometimes work worse when this app is "
+            "already elevated (an installer's own permission prompt can get silently "
+            "cancelled) - if you're only using winget, non-elevated may actually work "
+            "better.\n\n"
+            "Relaunch as Administrator now? This will close the current window."
+        )
+        if not proceed:
+            return
+        try:
+            import ctypes
+            if getattr(sys, 'frozen', False):
+                executable, params = sys.executable, ''
+            else:
+                python_dir = os.path.dirname(sys.executable)
+                pythonw_path = os.path.join(python_dir, 'pythonw.exe')
+                executable = pythonw_path if os.path.isfile(pythonw_path) else sys.executable
+                params = ' '.join(f'"{a}"' for a in sys.argv)
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
+            if result > 32:
+                self.root.destroy()
+                os._exit(0)
+            else:
+                messagebox.showwarning("Couldn't Relaunch Elevated",
+                                        "The elevation request didn't go through - continuing as-is.")
+        except Exception as e:
+            messagebox.showwarning("Couldn't Relaunch Elevated", f"Couldn't relaunch elevated: {e}")
+
+    def _on_close(self):
+        """Handles the window's [X] button and the Exit menu item alike.
+        root.destroy()/root.quit() alone only stop the Tkinter event loop
+        - they don't guarantee the underlying python.exe/pythonw.exe
+        process actually terminates, since any still-running background
+        thread (a version-check pool, an in-progress deployment thread,
+        etc.) can keep the interpreter alive after the window is gone,
+        leaving an invisible orphaned process (or, worse, a visible
+        console window still open if launched via python.exe rather than
+        pythonw.exe) with no way to close it from the UI anymore. Ending
+        with os._exit(0) makes the exit unconditional and immediate."""
+        try:
+            if self.install_engine.is_running():
+                if not messagebox.askyesno(
+                    "Deployment In Progress",
+                    "A deployment is currently running. Exit anyway?\n\n"
+                    "Anything already started (an installer, a script) will keep running in the "
+                    "background even after this window closes."
+                ):
+                    return
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        finally:
+            os._exit(0)
+
     def _deployment_finished(self):
         self.root.after(0, self._enable_ui)
-        self.log_text_insert("Deployment finished.\n")
-        self._update_status_panel()
+        self.root.after(0, lambda: self.log_text_insert("Deployment finished.\n"))
+        self.root.after(0, self._update_status_panel)
+        self.root.after(0, self._show_deployment_results)
+
+    def _generate_report(self, title="Deployment Report"):
+        """Builds the HTML report for whatever is currently in
+        install_engine.results and returns its path, or None if there's
+        nothing to report on yet."""
+        if self.install_engine.results.is_empty():
+            return None
+        reports_dir = os.path.join(self.config.base_dir, 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S')
+        report_path = os.path.join(reports_dir, f'report_{timestamp}.html')
+        json_log_path = None
+        session_logger = logging.getLogger('DeploymentKit')
+        json_log_path = getattr(session_logger, 'log_file_path', None)
+        return build_deployment_report(
+            self.install_engine.results, report_path,
+            json_log_path=json_log_path, title=title,
+        )
+
+    def _show_deployment_results(self):
+        """Post-run summary: counts, a per-item list, and a way to open
+        the full HTML report or retry just the failed items - instead of
+        the old behaviour where the outcome only ever lived in the
+        scrolling log."""
+        results = self.install_engine.results
+        if results.is_empty():
+            return
+
+        report_path = self._generate_report()
+
+        win = tk.Toplevel(self.root)
+        win.title("Deployment Results")
+        win.geometry("780x480")
+        win.transient(self.root)
+
+        counts = results.counts()
+        summary_frame = ttk.Frame(win)
+        summary_frame.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(summary_frame, text=f"Total: {len(results.items)}", font=('Arial', 10, 'bold')).pack(side=tk.LEFT, padx=8)
+        ttk.Label(summary_frame, text=f"Succeeded: {counts.get('success', 0)}", foreground='#2ea043').pack(side=tk.LEFT, padx=8)
+        ttk.Label(summary_frame, text=f"Failed: {counts.get('failed', 0)}", foreground='#c0392b').pack(side=tk.LEFT, padx=8)
+        ttk.Label(summary_frame, text=f"Skipped: {counts.get('skipped', 0)}", foreground='#d29922').pack(side=tk.LEFT, padx=8)
+
+        tree_frame = ttk.Frame(win)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        columns = ('category', 'name', 'status', 'message')
+        tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=14)
+        tree.heading('category', text='Category')
+        tree.heading('name', text='Name')
+        tree.heading('status', text='Status')
+        tree.heading('message', text='Message')
+        tree.column('category', width=110, anchor='w', stretch=False)
+        tree.column('name', width=180, anchor='w', stretch=False)
+        tree.column('status', width=80, anchor='center', stretch=False)
+        tree.column('message', width=360, anchor='w', stretch=True)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.configure(yscrollcommand=scroll.set)
+
+        def populate():
+            tree.delete(*tree.get_children())
+            for item in results.items:
+                label, _ = item.badge()
+                one_line_msg = (item.message or "").splitlines()[0] if item.message else ""
+                tree.insert('', 'end', values=(item.category, item.name, label, one_line_msg))
+        populate()
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        def open_report():
+            if report_path and os.path.exists(report_path):
+                webbrowser.open(f'file://{os.path.abspath(report_path)}')
+            else:
+                messagebox.showinfo("Report", "No report file was generated for this run.")
+
+        retry_btn = ttk.Button(btn_frame, text="Retry Failed")
+        open_btn = ttk.Button(btn_frame, text="Open Full Report", command=open_report)
+        close_btn = ttk.Button(btn_frame, text="Close", command=win.destroy)
+
+        def do_retry():
+            retryable = results.retryable_failed_items()
+            if not retryable:
+                messagebox.showinfo("Retry Failed", "There's nothing retryable to run again.")
+                return
+            retry_btn.config(state=tk.DISABLED)
+            self.log_text_insert(f"Retrying {len(retryable)} failed item(s)...\n")
+
+            def on_retry_finished():
+                def finish_ui():
+                    populate()
+                    retry_btn.config(state=tk.NORMAL)
+                    self.log_text_insert("Retry finished.\n")
+                    # Refresh the report on disk too so "Open Full Report"
+                    # reflects the retry outcome, not just the original run.
+                    nonlocal report_path
+                    report_path = self._generate_report(title="Deployment Report (includes retries)")
+                self.root.after(0, finish_ui)
+
+            started = self.install_engine.start_retry(retryable, on_finished=on_retry_finished)
+            if not started:
+                retry_btn.config(state=tk.NORMAL)
+                messagebox.showwarning("Retry Failed", "Couldn't start a retry - a deployment/retry may already be running.")
+
+        retry_btn.config(command=do_retry)
+        if not results.retryable_failed_items():
+            retry_btn.config(state=tk.DISABLED)
+
+        retry_btn.pack(side=tk.LEFT, padx=5)
+        open_btn.pack(side=tk.LEFT, padx=5)
+        close_btn.pack(side=tk.RIGHT, padx=5)
 
     def _cancel_deployment(self):
         self.install_engine.cancel()
@@ -1863,17 +2281,17 @@ class DeploymentGUI:
 
     def _collect_profile_data(self):
         """Return a dict representing the current GUI state."""
-        print("\n--- Saving Profile ---")
+        logging.getLogger('DeploymentKit').debug("\n--- Saving Profile ---")
         # Operations order
         ops = self.selected_operations[:]
-        print(f"Operations order: {ops}")
+        logging.getLogger('DeploymentKit').debug(f"Operations order: {ops}")
 
         # Apps: display_name -> selected_provider (only if selected)
         apps_state = {}
         for app in self.catalog.apps:
             if app.selected_provider is not None:
                 apps_state[app.display_name] = app.selected_provider
-        print(f"Apps state: {apps_state}")
+        logging.getLogger('DeploymentKit').debug(f"Apps state: {apps_state}")
 
         # Tweaks: name -> selected_action (only if action selected)
         tweaks_state = {}
@@ -1881,7 +2299,7 @@ class DeploymentGUI:
             action = tweak.get('selected_action')
             if action:
                 tweaks_state[tweak['name']] = action
-        print(f"Tweaks state: {tweaks_state}")
+        logging.getLogger('DeploymentKit').debug(f"Tweaks state: {tweaks_state}")
 
         # Activators: name -> {selected, switches}
         activators_state = {}
@@ -1897,11 +2315,11 @@ class DeploymentGUI:
                     'selected': selected,
                     'switches': switches
                 }
-        print(f"Activators state: {activators_state}")
+        logging.getLogger('DeploymentKit').debug(f"Activators state: {activators_state}")
 
         # External scripts (full list)
         ext_scripts = self.external_scripts[:]
-        print(f"External scripts count: {len(ext_scripts)}")
+        logging.getLogger('DeploymentKit').debug(f"External scripts count: {len(ext_scripts)}")
 
         # Backup: restore_selected_only and checked user sources
         restore_selected_only = self.restore_selected_only_var.get()
@@ -1913,7 +2331,7 @@ class DeploymentGUI:
             values = self.tree_backup.item(item, 'values')
             if values and values[0] == "☑":
                 checked_sources.append(src_path)
-        print(f"Backup: restore_selected_only={restore_selected_only}, checked_sources={checked_sources}")
+        logging.getLogger('DeploymentKit').debug(f"Backup: restore_selected_only={restore_selected_only}, checked_sources={checked_sources}")
 
         return {
             'operations_order': ops,
@@ -1933,7 +2351,7 @@ class DeploymentGUI:
         Apply profile data to the current GUI state and refresh.
         Returns a dict of missing items per category.
         """
-        print("\n--- Loading Profile ---")
+        logging.getLogger('DeploymentKit').debug("\n--- Loading Profile ---")
         missing = {
             'Apps': [],
             'Tweaks': [],
@@ -1946,52 +2364,52 @@ class DeploymentGUI:
         valid_internal = {op['internal'] for op in self.available_ops}
         self.selected_operations = [op for op in new_ops if op in valid_internal]
         self._refresh_selected_list()
-        print(f"Operations applied: {self.selected_operations}")
+        logging.getLogger('DeploymentKit').debug(f"Operations applied: {self.selected_operations}")
 
         # 2. Apps (without reloading catalog)
         apps_state = data.get('apps', {})
-        print(f"Apps from profile: {apps_state}")
+        logging.getLogger('DeploymentKit').debug(f"Apps from profile: {apps_state}")
         for app in self.catalog.apps:
             provider = apps_state.get(app.display_name)
             if provider is not None:
                 # Check availability
                 if provider == 'offline' and (not app.is_offline_available or not app.offline_path):
                     missing['Apps'].append(f"{app.display_name} (offline not available)")
-                    print(f"  [MISSING] {app.display_name}: offline unavailable")
+                    logging.getLogger('DeploymentKit').debug(f"  [MISSING] {app.display_name}: offline unavailable")
                     continue
                 elif provider == 'winget' and not app.winget_id:
                     missing['Apps'].append(f"{app.display_name} (winget ID missing)")
-                    print(f"  [MISSING] {app.display_name}: winget ID missing")
+                    logging.getLogger('DeploymentKit').debug(f"  [MISSING] {app.display_name}: winget ID missing")
                     continue
                 elif provider == 'choco' and not app.choco_id:
                     missing['Apps'].append(f"{app.display_name} (choco ID missing)")
-                    print(f"  [MISSING] {app.display_name}: choco ID missing")
+                    logging.getLogger('DeploymentKit').debug(f"  [MISSING] {app.display_name}: choco ID missing")
                     continue
                 app.selected_provider = provider
-                print(f"  [OK] {app.display_name} -> {provider}")
+                logging.getLogger('DeploymentKit').debug(f"  [OK] {app.display_name} -> {provider}")
             else:
                 app.selected_provider = None
         self._refresh_install_tab(reload_catalog=False)   # keep catalog changes
 
         # 3. Tweaks
         tweaks_state = data.get('tweaks', {})
-        print(f"Tweaks from profile: {tweaks_state}")
+        logging.getLogger('DeploymentKit').debug(f"Tweaks from profile: {tweaks_state}")
         tweaks_list = self.config.tweaks.get('tweaks', [])
         tweak_name_to_index = {t['name']: i for i, t in enumerate(tweaks_list)}
         for tweak_name, action in tweaks_state.items():
             if tweak_name in tweak_name_to_index:
                 tweaks_list[tweak_name_to_index[tweak_name]]['selected_action'] = action
-                print(f"  [OK] {tweak_name} -> {action}")
+                logging.getLogger('DeploymentKit').debug(f"  [OK] {tweak_name} -> {action}")
             else:
                 missing['Tweaks'].append(tweak_name)
-                print(f"  [MISSING] {tweak_name}")
+                logging.getLogger('DeploymentKit').debug(f"  [MISSING] {tweak_name}")
         self.config.tweaks['tweaks'] = tweaks_list
         self.config.save_tweaks()
         self._refresh_tweaks_tab()   # reloads from disk, good
 
         # 4. Activators (modify treeview directly, do NOT refresh the whole tab)
         activators_state = data.get('activators', {})
-        print(f"Activators from profile: {activators_state}")
+        logging.getLogger('DeploymentKit').debug(f"Activators from profile: {activators_state}")
         activators = self.config.activators.get('activators', [])
         activator_names = {a['name'] for a in activators}
         for item in self.tree_activators.get_children():
@@ -2004,7 +2422,7 @@ class DeploymentGUI:
                 check = "☑" if state['selected'] else "☐"
                 switches = state['switches']
                 self.tree_activators.item(item, values=(check, name, values[2], switches, values[4]))
-                print(f"  [OK] {name}: selected={state['selected']}, switches='{switches}'")
+                logging.getLogger('DeploymentKit').debug(f"  [OK] {name}: selected={state['selected']}, switches='{switches}'")
             else:
                 # Uncheck if not in profile
                 self.tree_activators.item(item, values=("☐", *values[1:]))
@@ -2012,23 +2430,23 @@ class DeploymentGUI:
         for act_name in activators_state.keys():
             if act_name not in activator_names:
                 missing['Activators'].append(act_name)
-                print(f"  [MISSING] Activator '{act_name}' not found in current config")
+                logging.getLogger('DeploymentKit').debug(f"  [MISSING] Activator '{act_name}' not found in current config")
 
         # 5. External scripts
         ext_scripts = data.get('external_scripts', [])
         self.external_scripts = ext_scripts
         self._refresh_external_tab()
-        print(f"External scripts loaded: {len(ext_scripts)}")
+        logging.getLogger('DeploymentKit').debug(f"External scripts loaded: {len(ext_scripts)}")
 
         # 6. Backup settings (modify treeview directly, do NOT refresh sources list)
         backup_data = data.get('backup', {})
-        print(f"Backup data from profile: {backup_data}")
+        logging.getLogger('DeploymentKit').debug(f"Backup data from profile: {backup_data}")
         if backup_data:
             if 'restore_selected_only' in backup_data:
                 self.restore_selected_only_var.set(backup_data['restore_selected_only'])
-                print(f"  restore_selected_only set to {backup_data['restore_selected_only']}")
+                logging.getLogger('DeploymentKit').debug(f"  restore_selected_only set to {backup_data['restore_selected_only']}")
             checked_sources = backup_data.get('checked_sources', [])
-            print(f"  checked_sources from profile: {checked_sources}")
+            logging.getLogger('DeploymentKit').debug(f"  checked_sources from profile: {checked_sources}")
             # Mark each user source in tree
             for src_path, info in self.backup_tree_items.items():
                 if info['special']:
@@ -2038,18 +2456,18 @@ class DeploymentGUI:
                 check = "☑" if should_check else "☐"
                 source_text = self.tree_backup.item(item, 'values')[1]
                 self.tree_backup.item(item, values=(check, source_text))
-                print(f"  {'[OK]' if should_check else '[UNCHECK]'} {src_path}")
+                logging.getLogger('DeploymentKit').debug(f"  {'[OK]' if should_check else '[UNCHECK]'} {src_path}")
             # Find missing sources
             current_source_set = set(self.backup_engine.sources)
             for src in checked_sources:
                 if src not in current_source_set:
                     missing['Backup Sources'].append(src)
-                    print(f"  [MISSING] Backup source '{src}' not in current sources list")
+                    logging.getLogger('DeploymentKit').debug(f"  [MISSING] Backup source '{src}' not in current sources list")
 
         # Do NOT refresh these tabs again, because we've already applied states.
         # (We already refreshed tweaks and external, and Apps with reload_catalog=False)
         # We might want to refresh the activators tab? No, we modified treeview directly.
         # We might want to ensure the Activator tab filter dropdown reflects any new categories? That's optional.
 
-        print(f"\nMissing items summary: {missing}")
+        logging.getLogger('DeploymentKit').debug(f"\nMissing items summary: {missing}")
         return missing
