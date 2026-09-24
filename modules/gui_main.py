@@ -312,6 +312,13 @@ class DeploymentGUI:
         filter_combo.pack(side=tk.LEFT, padx=5)
         filter_combo.bind('<<ComboboxSelected>>', lambda e: self._refresh_install_tab())
 
+        ttk.Label(filter_frame, text="Filter by Category:").pack(side=tk.LEFT, padx=15)
+        self.category_filter_var = tk.StringVar(value='All')
+        self.category_filter_combo = ttk.Combobox(filter_frame, textvariable=self.category_filter_var,
+                                                    values=['All'], state='readonly', width=16)
+        self.category_filter_combo.pack(side=tk.LEFT, padx=5)
+        self.category_filter_combo.bind('<<ComboboxSelected>>', lambda e: self._refresh_install_tab())
+
         ttk.Button(filter_frame, text="Check Version", command=self._refresh_versions).pack(side=tk.RIGHT, padx=5)
         self.version_check_status_var = tk.StringVar(value="")
         ttk.Label(filter_frame, textvariable=self.version_check_status_var, foreground='#555').pack(side=tk.RIGHT, padx=8)
@@ -334,6 +341,15 @@ class DeploymentGUI:
         search_text = self.search_var.get().strip().lower()
         filter_type = self.filter_var.get().lower()
 
+        # Repopulate category dropdown from current catalog, preserving selection where possible
+        categories = sorted(set((app.category or 'Uncategorized') for app in self.catalog.apps))
+        current_category = self.category_filter_var.get()
+        self.category_filter_combo['values'] = ['All'] + categories
+        if current_category not in (['All'] + categories):
+            self.category_filter_var.set('All')
+            current_category = 'All'
+        filter_category = current_category
+
         # Create Treeview
         columns = ('name', 'category', 'type', 'offline', 'winget', 'choco')
         self.tree_apps = ttk.Treeview(self.install_container, columns=columns, show='headings', height=15)
@@ -348,9 +364,9 @@ class DeploymentGUI:
         self.tree_apps.column('name', width=250, anchor='w', stretch=False)
         self.tree_apps.column('category', width=120, anchor='w', stretch=False)
         self.tree_apps.column('type', width=80, anchor='w', stretch=False)
-        self.tree_apps.column('offline', width=120, anchor='center', stretch=False)
-        self.tree_apps.column('winget', width=150, anchor='center', stretch=False)
-        self.tree_apps.column('choco', width=150, anchor='center', stretch=False)
+        self.tree_apps.column('offline', width=120, anchor='w', stretch=False)
+        self.tree_apps.column('winget', width=150, anchor='w', stretch=False)
+        self.tree_apps.column('choco', width=150, anchor='w', stretch=False)
 
         # Scrollbar
         scrollbar = ttk.Scrollbar(self.install_container, orient="vertical", command=self.tree_apps.yview)
@@ -369,6 +385,8 @@ class DeploymentGUI:
             if search_text and search_text not in app.display_name.lower():
                 continue
             if filter_type != 'all' and app.install_type != filter_type:
+                continue
+            if filter_category != 'All' and (app.category or 'Uncategorized') != filter_category:
                 continue
 
             # Build initial cell texts
@@ -503,10 +521,10 @@ class DeploymentGUI:
         elif provider == 'choco':
             available = bool(app.choco_id)
         else:
-            return "‑"
+            return " ‑"
 
         if not available:
-            return "‑"
+            return " ‑"
 
         # Determine if selected
         selected = (app.selected_provider == provider)
@@ -521,9 +539,9 @@ class DeploymentGUI:
 
         checkbox = "☑" if selected else "☐"
         if version:
-            return f"{checkbox} {version}"
+            return f" {checkbox} {version}"
         else:
-            return checkbox
+            return f" {checkbox}"
 
     def _refresh_app_row(self, app):
         """Update the treeview row for a specific app with current data."""
